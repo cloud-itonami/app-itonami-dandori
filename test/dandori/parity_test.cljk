@@ -1,0 +1,43 @@
+(ns dandori.parity-test
+  "parity fixture（test/fixtures/parity.edn）を adapter で全行照合する。
+
+  同じ表を guest が 2 か所で通す:
+    - aiueos/dandori_core.cljk の test-*（amu test、:jvm-kir :js :wasm）
+    - test/guest_parity.mjs（コンパイル済み wasm を kototama-browser-host-v1 で）
+  ここでは関数別の行数も guest の docstring と照合する —— 表に行を足して
+  guest の test-* に写し忘れると、この件数が先にずれる。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            ["fs" :as fs]
+            [dandori.core :as core]))
+
+(def rows (edn/read-string (fs/readFileSync "test/fixtures/parity.edn" "utf8")))
+
+(def adapter
+  {"priority-rank" core/priority-rank
+   "estimate-valid?" core/estimate-valid?
+   "closed?" core/closed?
+   "active?" core/active?
+   "transition-kind" core/transition-kind
+   "cycle-progress-permille" core/cycle-progress-permille
+   "sla-status" core/sla-status
+   "next-number" core/next-number})
+
+(deftest every-row-matches
+  (doseq [{f :fn args :args expect :expect} rows]
+    (testing (str f " " (pr-str args))
+      (is (= expect (apply (adapter f) args))))))
+
+(deftest row-counts-match-guest-docstring
+  (testing "aiueos/dandori_core.cljk の docstring に書いた関数別件数"
+    (is (= {"priority-rank" 7 "estimate-valid?" 22 "closed?" 5 "active?" 3
+            "transition-kind" 14 "cycle-progress-permille" 11 "sla-status" 7
+            "next-number" 4}
+           (frequencies (map :fn rows))))
+    (is (= 73 (count rows)))))
+
+(deftest every-function-is-exported-by-the-guest
+  (let [src (fs/readFileSync "aiueos/dandori_core.cljk" "utf8")]
+    (doseq [f (keys adapter)]
+      (is (re-find (re-pattern (str "\\(defn " (.replace f "?" "\\?") " ")) src)
+          (str f " が guest に無い")))))

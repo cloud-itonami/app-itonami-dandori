@@ -1,0 +1,101 @@
+(ns dandori.core-test
+  "値モデル（dandori.core）の振る舞い。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [dandori.core :as core]))
+
+(def now "2026-10-22T00:00:00.000Z")
+
+(defn- sample-db []
+  (:db (core/merge-import core/empty-db core/sample-issues now)))
+
+(deftest create-issue-allocates-next-number
+  (let [db (sample-db)
+        {:keys [db identifier]} (core/create-issue db "DAN" {:title "新しい課題"} now)]
+    (is (= "DAN-6" identifier))
+    (is (= "Todo" (get-in db [:issues "DAN-6" :state])))
+    (is (= :unstarted (get-in db [:issues "DAN-6" :state-type])))
+    (testing "新しい team は 1 番から"
+      (is (= "NEW-1" (:identifier (core/create-issue db "NEW" {} now)))))))
+
+(deftest set-state-moves-timestamps
+  (let [db (sample-db)
+        t2 "2026-10-23T00:00:00.000Z"]
+    (testing "Todo → In Progress は start（started-at を入れる）"
+      (let [db (core/set-state db "DAN-3" "In Progress" t2)]
+        (is (= :started (get-in db [:issues "DAN-3" :state-type])))
+        (is (= t2 (get-in db [:issues "DAN-3" :started-at])))))
+    (testing "In Progress → Done は complete"
+      (let [db (core/set-state db "DAN-2" "Done" t2)]
+        (is (= t2 (get-in db [:issues "DAN-2" :completed-at])))
+        (testing "既にある started-at は動かさない"
+          (is (= "2026-10-04T09:00:00.000Z" (get-in db [:issues "DAN-2" :started-at]))))))
+    (testing "Done → Todo は reopen（completed-at を外す）"
+      (let [db (core/set-state db "DAN-1" "Todo" t2)]
+        (is (nil? (get-in db [:issues "DAN-1" :completed-at])))
+        (is (= :unstarted (get-in db [:issues "DAN-1" :state-type])))))
+    (testing "Duplicate は canceled 型"
+      (let [db (core/set-state db "DAN-3" "Duplicate" t2)]
+        (is (= :canceled (get-in db [:issues "DAN-3" :state-type])))
+        (is (= t2 (get-in db [:issues "DAN-3" :canceled-at])))))))
+
+(deftest guess-state-type-fallback
+  (is (= :unstarted (core/guess-state-type "Todo")))
+  (is (= :started (core/guess-state-type "In Review")))
+  (is (= :started (core/guess-state-type "QA Waiting")))
+  (is (= :completed (core/guess-state-type "Shipped to prod")))
+  (is (= :canceled (core/guess-state-type "Won't fix")))
+  (is (= :triage (core/guess-state-type "Inbox")))
+  (testing "どれにも当たらない名前は backlog（進行中・完了に数えない側）"
+    (is (= :backlog (core/guess-state-type "Parking lot")))))
+
+(deftest estimation
+  (testing "取り込んだ値から scale を推定する"
+    (is (= {:scale :notUsed :allow-zero? false :extended? false} (core/infer-estimation [])))
+    (is (= :fibonacci (:scale (core/infer-estimation [1 2 3 5]))))
+    (is (= :exponential (:scale (core/infer-estimation [4 8 16]))))
+    (is (= {:scale :fibonacci :allow-zero? true :extended? true}
+           (core/infer-estimation [0 13 21]))))
+  (testing "team の設定で見積を検査する"
+    (let [team {:estimation {:scale :fibonacci :allow-zero? false :extended? false}}]
+      (is (nil? (core/estimate-problem team 5)))
+      (is (nil? (core/estimate-problem team nil)))
+      (is (= "4 は Fibonacci の見積値ではありません" (core/estimate-problem team 4)))
+      (is (some? (core/estimate-problem {:estimation {:scale :notUsed}} 1))))))
+
+(deftest cycle-progress-and-sla
+  (let [db (sample-db)
+        issues (core/team-issues db "DAN")
+        in-cycle (filter #(= 1 (get-in % [:cycle :number])) issues)]
+    (testing "Cycle 1: Done 2 / (2 + 3 + 5) — Canceled の 8 は scope 外"
+      (is (= {:permille 200 :total 4 :completed 1 :canceled 1}
+             (core/cycle-progress in-cycle 1))))
+    (is (= [{:number 1 :name "Cycle 1"}] (core/cycles issues)))
+    (testing "SLA: DAN-3 は 10/6 12:00 に high、10/8 に breached"
+      (let [issue (get-in db [:issues "DAN-3"])]
+        (is (= 0 (core/issue-sla issue (core/parse-time "2026-10-04T00:00:00.000Z"))))
+        (is (= 2 (core/issue-sla issue (core/parse-time "2026-10-06T12:00:00.000Z"))))
+        (is (= 3 (core/issue-sla issue (core/parse-time "2026-10-08T00:00:00.000Z"))))))))
+
+(deftest grouping-and-sorting
+  (let [db (sample-db)
+        groups (core/grouped-by-type (core/team-issues db "DAN"))]
+    (is (= core/state-types (map first groups)))
+    (is (= ["DAN-5"] (map :identifier (second (first groups)))))
+    (testing "Urgent が先、No priority が後"
+      (is (= ["DAN-3" "DAN-2" "DAN-1" "DAN-4" "DAN-5"]
+             (map :identifier (core/sort-issues (core/team-issues db "DAN"))))))))
+
+(deftest merge-import-replaces-by-identifier
+  (let [db (sample-db)
+        {:keys [db added replaced]}
+        (core/merge-import db [{:team-key "DAN" :identifier "DAN-2" :number 2 :title "置き換え"
+                                :state "Done" :state-type :completed :priority 2}
+                               {:team-key "DAN" :title "番号なし" :state "QA" :state-type :started
+                                :priority 0}]
+                           now)]
+    (is (= 1 added))
+    (is (= 1 replaced))
+    (is (= "置き換え" (get-in db [:issues "DAN-2" :title])))
+    (is (= "番号なし" (get-in db [:issues "DAN-6" :title])))
+    (testing "知らない状態名は team の状態に足す"
+      (is (some #(= {:name "QA" :type :started} %) (get-in db [:teams "DAN" :states]))))))

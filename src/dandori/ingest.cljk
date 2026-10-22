@@ -1,0 +1,276 @@
+(ns dandori.ingest
+  "Linear のエクスポートを正規化された課題の列にする。入力は 2 形式:
+
+  - **CSV**（Linear の「Export CSV」）。列は名前で対応づけ（大文字小文字は
+    区別しない）、知らない列は無視する。RFC 4180 の引用（\"\" のエスケープ、
+    引用内の改行・カンマ）を扱う。
+  - **GraphQL JSON**（`{\"data\":{\"issues\":{\"nodes\":[…]}}}`）。
+    `{\"issues\":{\"nodes\":…}}`・`{\"nodes\":…}`・課題の配列もそのまま受ける。
+
+  出力は {:format :issues :warnings}。課題は dandori.core/merge-import が受ける形:
+
+    {:team-key \"ENG\" :team-name \"Engineering\" :identifier \"ENG-42\" :number 42
+     :title … :description … :state \"In Progress\" :state-type :started
+     :priority 2 :estimate 3 :labels [\"bug\"] :assignee … :creator … :project …
+     :cycle {:number 3 :name \"Cycle 3\"} :due-date … :parent \"ENG-40\"
+     :created-at … :updated-at … :started-at … :completed-at … :canceled-at …
+     :sla {:medium-risk-at … :high-risk-at … :breaches-at …} :comments [{:body :created-at}]}
+
+  値が無い欄はキーごと持たない（nil を詰めない）。CSV は状態の型を持たないので、
+  team の既定状態の名前と照合し、外れたら dandori.core/guess-state-type で推定する
+  （dandori が書き出した CSV は末尾の \"Status Type\" 列で型を持ち帰る）。
+
+  この ns はネットワークに触れない。JSON の構文解析だけはホストに任せる
+  （ブラウザ／kbb では JSON.parse）。"
+  (:require [kotoba.lang.text :as text]
+            [dandori.core :as core]))
+
+;; ───────── CSV（RFC 4180） ─────────
+
+(defn- outside-tokens
+  "引用の外側の断片を、本文・カンマ・改行のトークンに分ける。"
+  [s]
+  (text/re-seq #"[^,\r\n]+|,|\r?\n|\r" s))
+
+(defn parse-csv
+  "CSV 文字列 → 行のベクタ（各行は文字列のベクタ）。
+
+  `\"` で分割すると偶数番目が引用の外、奇数番目が引用の中になる。外側の
+  断片が空で、かつ両隣が引用の中であれば、それは `\"\"`（引用内の \" ）。
+  文字単位の走査より速く、ブラウザ（scittle）でも大きなエクスポートを読める。"
+  [s]
+  (let [parts (text/split (or s "") #"\"" -1)
+        last-i (dec (count parts))]
+    (loop [i 0, field "", row [], rows [], touched? false]
+      (if (> i last-i)
+        (let [rows (if (or touched? (seq row)) (conj rows (conj row field)) rows)]
+          (vec (remove #(= % [""]) rows)))
+        (let [part (nth parts i)]
+          (if (odd? i)
+            ;; 引用の中: そのまま本文
+            (recur (inc i) (str field part) row rows true)
+            (if (and (= part "") (pos? i) (< i last-i))
+              ;; "" のエスケープ
+              (recur (inc i) (str field "\"") row rows true)
+              (let [[field row rows touched?]
+                    (reduce (fn [[field row rows touched?] tok]
+                              (cond
+                                (= tok ",") ["" (conj row field) rows true]
+                                (#{"\n" "\r\n" "\r"} tok) ["" [] (conj rows (conj row field)) false]
+                                :else [(str field tok) row rows true]))
+                            [field row rows touched?]
+                            (outside-tokens part))]
+                (recur (inc i) field row rows touched?)))))))))
+
+(defn csv-records
+  "ヘッダ行 + データ行 → 小文字ヘッダをキーにした map の列。"
+  [rows]
+  (let [header (mapv #(text/lower (text/trim %)) (first rows))]
+    (mapv (fn [row] (zipmap header (map #(or % "") (concat row (repeat nil)))))
+          (rest rows))))
+
+;; ───────── 値の読み方 ─────────
+
+(defn- blank->nil [s]
+  (when (and (string? s) (not (text/blank? s))) (text/trim s)))
+
+(defn- ->long [x]
+  (cond
+    (number? x) (long x)
+    (string? x) (when-let [s (blank->nil x)]
+                  (when (text/re-matches #"-?\d+" s) (parse-long s)))
+    :else nil))
+
+(def ^:private priority-by-text
+  {"urgent" 1 "high" 2 "medium" 3 "normal" 3 "low" 4
+   "no priority" 0 "none" 0 "" 0})
+
+(defn parse-priority
+  "数（0..4）か Linear のラベル文字列。{:priority n} か {:priority 0 :warning …}。"
+  [x]
+  (let [n (->long x)]
+    (cond
+      (and n (<= 0 n 4)) {:priority n}
+      (string? x) (if-let [p (priority-by-text (text/lower (text/trim x)))]
+                    {:priority p}
+                    {:priority 0 :warning (str "優先度 \"" x "\" を読めないので No priority にしました")})
+      (nil? x) {:priority 0}
+      :else {:priority 0 :warning (str "優先度 " x " を読めないので No priority にしました")})))
+
+(defn parse-identifier
+  "\"ENG-42\" → {:team-key \"ENG\" :number 42}。形が違えば nil。"
+  [s]
+  (when-let [[_ k n] (and (string? s) (text/re-matches #"([A-Za-z][A-Za-z0-9]*)-(\d+)" (text/trim s)))]
+    {:team-key (text/upper k) :number (parse-long n)}))
+
+(defn- team-key-from-name
+  "identifier が無い行の team key。名前の英数字の頭から最大 3 文字。"
+  [team-name]
+  (let [letters (apply str (text/re-seq #"[A-Za-z0-9]" (or team-name "")))
+        k (text/upper (subs letters 0 (min 3 (count letters))))]
+    (if (core/valid-team-key? k) k "TEAM")))
+
+(defn- split-labels [s]
+  (if-let [s (blank->nil s)]
+    (vec (keep blank->nil (text/split s #",")))
+    []))
+
+(defn- state-type-from-string [s]
+  (let [k (some-> s blank->nil text/lower keyword)]
+    (when (some #{k} core/state-types) k)))
+
+(defn- compact
+  "nil・空文字・空 map の値を落とす。:title と :description の空文字、:labels と
+  :comments の空ベクタは「無い」ではなく「空」なので残す。"
+  [m]
+  (into {} (remove (fn [[k v]]
+                     (and (not (#{:labels :comments :title :description} k))
+                          (or (nil? v) (= "" v) (and (map? v) (empty? v))))))
+        m))
+
+;; ───────── CSV の課題 ─────────
+
+(defn- csv-issue [rec]
+  (let [g #(blank->nil (get rec %))
+        ident (parse-identifier (g "id"))
+        team-name (g "team")
+        k (or (:team-key ident) (team-key-from-name team-name))
+        {:keys [priority warning]} (parse-priority (get rec "priority"))
+        state (or (g "status") "Todo")
+        state-type (or (state-type-from-string (g "status type"))
+                       (core/guess-state-type state))
+        cycle-number (->long (g "cycle number"))]
+    {:issue (compact
+             {:team-key k
+              :team-name team-name
+              :identifier (when ident (str k "-" (:number ident)))
+              :number (:number ident)
+              :title (or (g "title") "")
+              :description (or (get rec "description") "")
+              :state state
+              :state-type state-type
+              :priority priority
+              :estimate (->long (g "estimate"))
+              :labels (split-labels (get rec "labels"))
+              :assignee (g "assignee")
+              :creator (g "creator")
+              :project (g "project")
+              :cycle (when cycle-number
+                       (compact {:number cycle-number :name (g "cycle name")}))
+              :due-date (g "due date")
+              :parent (g "parent issue")
+              :created-at (g "created")
+              :updated-at (g "updated")
+              :started-at (g "started")
+              :completed-at (g "completed")
+              :canceled-at (g "canceled")})
+     :warning warning}))
+
+(defn linear-csv
+  "Linear の CSV エクスポート → {:format :linear-csv :issues :warnings}。"
+  [s]
+  (let [rows (parse-csv s)
+        recs (csv-records rows)
+        header (set (map #(text/lower (text/trim %)) (first rows)))]
+    (if-not (and (contains? header "title") (or (contains? header "id") (contains? header "team")))
+      {:format :linear-csv :issues []
+       :warnings ["CSV の見出しに Title と ID（または Team）が見つかりません。Linear の CSV エクスポートを貼り付けてください。"]}
+      (let [results (mapv csv-issue recs)]
+        {:format :linear-csv
+         :issues (mapv :issue results)
+         :warnings (vec (keep :warning results))}))))
+
+;; ───────── GraphQL JSON の課題 ─────────
+
+(defn parse-json
+  "JSON 文字列 → Clojure の値（キーは文字列のまま）。読めなければ例外。"
+  [s]
+  #?(:cljs (js->clj (.parse js/JSON s))
+     :clj (throw (ex-info "JSON の構文解析はホスト（ブラウザ／kbb の JSON.parse）が担う"
+                          {:input-length (count s)}))))
+
+(defn- nodes [x]
+  (cond
+    (sequential? x) x
+    (map? x) (or (get x "nodes") [])
+    :else []))
+
+(defn- issue-nodes [data]
+  (cond
+    (sequential? data) data
+    (get-in data ["data" "issues"]) (nodes (get-in data ["data" "issues"]))
+    (get data "issues") (nodes (get data "issues"))
+    (get data "nodes") (get data "nodes")
+    :else nil))
+
+(defn- graphql-issue [node]
+  (let [ident (parse-identifier (get node "identifier"))
+        team (get node "team")
+        k (or (some-> (get team "key") text/upper)
+              (:team-key ident)
+              (team-key-from-name (get team "name")))
+        state (get node "state")
+        state-name (or (blank->nil (get state "name")) "Todo")
+        {:keys [priority warning]} (parse-priority (get node "priority"))
+        number (or (->long (get node "number")) (:number ident))
+        cycle (get node "cycle")
+        sla (compact {:medium-risk-at (get node "slaMediumRiskAt")
+                      :high-risk-at (get node "slaHighRiskAt")
+                      :breaches-at (get node "slaBreachesAt")})]
+    {:issue (compact
+             {:team-key k
+              :team-name (get team "name")
+              :identifier (when number (str k "-" number))
+              :number number
+              :title (or (get node "title") "")
+              :description (or (get node "description") "")
+              :state state-name
+              :state-type (or (state-type-from-string (get state "type"))
+                              (core/guess-state-type state-name))
+              :priority priority
+              :estimate (->long (get node "estimate"))
+              :labels (vec (keep #(blank->nil (get % "name")) (nodes (get node "labels"))))
+              :assignee (or (get-in node ["assignee" "name"]) (get-in node ["assignee" "displayName"]))
+              :creator (or (get-in node ["creator" "name"]) (get-in node ["creator" "displayName"]))
+              :project (get-in node ["project" "name"])
+              :cycle (when (map? cycle)
+                       (compact {:number (->long (get cycle "number")) :name (get cycle "name")}))
+              :due-date (get node "dueDate")
+              :parent (get-in node ["parent" "identifier"])
+              :created-at (get node "createdAt")
+              :updated-at (get node "updatedAt")
+              :started-at (get node "startedAt")
+              :completed-at (get node "completedAt")
+              :canceled-at (get node "canceledAt")
+              :sla sla
+              :comments (vec (keep (fn [c] (when-let [b (get c "body")]
+                                             (compact {:body b :created-at (get c "createdAt")})))
+                                   (nodes (get node "comments"))))})
+     :warning warning}))
+
+(defn linear-graphql
+  "構文解析済みの GraphQL JSON → {:format :linear-graphql :issues :warnings}。"
+  [data]
+  (if-let [ns (issue-nodes data)]
+    (let [results (mapv graphql-issue (filter map? ns))]
+      {:format :linear-graphql
+       :issues (mapv :issue results)
+       :warnings (vec (keep :warning results))})
+    {:format :linear-graphql :issues []
+     :warnings ["JSON に issues.nodes が見つかりません。Linear の GraphQL の issues クエリ結果を貼り付けてください。"]}))
+
+;; ───────── 入口 ─────────
+
+(defn ingest
+  "貼り付け／ファイルの文字列を形式判定して取り込む。先頭が { か [ なら JSON、
+  それ以外は CSV。JSON が読めなければ {:issues [] :warnings [理由]}。"
+  [s]
+  (let [t (text/trim (or s ""))]
+    (cond
+      (= "" t) {:format :empty :issues [] :warnings ["取り込む内容が空です"]}
+      (or (text/starts-with? t "{") (text/starts-with? t "["))
+      (try (linear-graphql (parse-json t))
+           (catch #?(:cljs :default :clj Exception) e
+             {:format :linear-graphql :issues []
+              :warnings [(str "JSON として読めません: " (ex-message e))]}))
+      :else (linear-csv s))))

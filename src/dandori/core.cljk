@@ -1,0 +1,425 @@
+(ns dandori.core
+  "dandori の adapter と値モデル — guest（aiueos/dandori_core.cljk）と**同名・
+  同引数順・同結果**の判定関数と、その上に建つ課題トラッカーの純関数。
+
+  ## guest と同じ判定
+
+  `priority-rank` `estimate-valid?` `closed?` `active?` `transition-kind`
+  `cycle-progress-permille` `sla-status` `next-number` は guest の写し。入力も
+  出力も整数（vector-i64 は Clojure の vector）で、test/fixtures/parity.edn の
+  全行を guest（3 target + wasm）とこちら（kbb）の両方が通す。
+
+  ## 値モデル（db）
+
+    {:teams  {\"ENG\" {:key \"ENG\" :name \"Engineering\"
+                      :states [{:name \"Todo\" :type :unstarted} …]
+                      :estimation {:scale :fibonacci :allow-zero? false :extended? false}}}
+     :issues {\"ENG-1\" {:identifier \"ENG-1\" :team \"ENG\" :number 1 :title …
+                        :state \"Todo\" :state-type :unstarted :priority 0
+                        :estimate nil :labels [] :cycle nil :comments [] …}}}
+
+  時刻は ISO-8601 文字列のまま持ち、判定に要るときだけ epoch ミリ秒にする。
+  この ns は I/O を持たない —— 永続化（localStorage）はブラウザ側の effect。
+
+  ## Linear との関係
+
+  データの形（state type・priority の数・estimate scale・identifier の形）は
+  Linear に合わせる。判定の規則（サイクル進捗の数え方、未知の状態名の型推定）は
+  dandori のもので、Linear の内部実装の再現を主張しない。"
+  (:require [kotoba.lang.text :as text]))
+
+;; ───────── 符号化 ─────────
+
+(def state-types
+  "Linear の WorkflowState.type。並びは guest の符号（0..5）と同じ。"
+  [:triage :backlog :unstarted :started :completed :canceled])
+
+(def state-type-code (zipmap state-types (range)))
+(def code->state-type (zipmap (range) state-types))
+
+(def state-type-label
+  {:triage "Triage" :backlog "Backlog" :unstarted "Todo"
+   :started "In Progress" :completed "Done" :canceled "Canceled"})
+
+(def priorities
+  "Linear の priority の数とラベル。"
+  [[0 "No priority"] [1 "Urgent"] [2 "High"] [3 "Medium"] [4 "Low"]])
+
+(def priority-label (into {} priorities))
+
+(def scales
+  "Linear の team.issueEstimationType。並びは guest の符号（0..4）と同じ。"
+  [:notUsed :exponential :fibonacci :linear :tShirt])
+
+(def scale-code (zipmap scales (range)))
+
+(def scale-label
+  {:notUsed "見積を使わない" :exponential "Exponential" :fibonacci "Fibonacci"
+   :linear "Linear" :tShirt "T-Shirt"})
+
+(def t-shirt-label {1 "XS" 2 "S" 3 "M" 5 "L" 8 "XL" 13 "XXL" 21 "XXXL"})
+
+(def scale-candidates
+  "UI に並べる見積値（拡張値込み）。妥当性は estimate-valid? が決める。"
+  {:exponential [1 2 4 8 16 32 64]
+   :fibonacci [1 2 3 5 8 13 21]
+   :linear [1 2 3 4 5 6 7]
+   :tShirt [1 2 3 5 8 13 21]})
+
+(def default-states
+  "Linear の新規 team が持つ状態の組。import に状態定義が無いときに使う。"
+  [{:name "Triage" :type :triage}
+   {:name "Backlog" :type :backlog}
+   {:name "Todo" :type :unstarted}
+   {:name "In Progress" :type :started}
+   {:name "In Review" :type :started}
+   {:name "Done" :type :completed}
+   {:name "Canceled" :type :canceled}
+   {:name "Duplicate" :type :canceled}])
+
+;; ───────── guest と同じ判定（parity） ─────────
+
+(defn- flag [b] (if b 1 0))
+
+(defn- valid-type? [t] (and (integer? t) (<= 0 t 5)))
+
+(defn priority-rank [p]
+  (case p
+    1 0
+    2 1
+    3 2
+    4 3
+    0 4
+    -1))
+
+(defn- member [v base ext extended]
+  (flag (or (some #(= v %) base)
+            (and (= extended 1) (some #(= v %) ext)))))
+
+(defn estimate-valid? [scale value allow-zero extended]
+  (cond
+    (= scale 0) 0
+    (< value 0) 0
+    (= value 0) (flag (and (<= 1 scale 4) (= allow-zero 1)))
+    (= scale 1) (member value [1 2 4 8 16] [32 64] extended)
+    (= scale 2) (member value [1 2 3 5 8] [13 21] extended)
+    (= scale 3) (flag (<= value (if (= extended 1) 7 5)))
+    (= scale 4) (member value [1 2 3 5 8] [13 21] extended)
+    :else 0))
+
+(defn closed? [t] (flag (or (= t 4) (= t 5))))
+
+(defn active? [t] (flag (= t 3)))
+
+(defn transition-kind [from to]
+  (cond
+    (not (valid-type? from)) -1
+    (not (valid-type? to)) -1
+    (= from to) 0
+    (= to 4) 2
+    (= to 5) 3
+    (= (closed? from) 1) 4
+    (= to 3) 1
+    :else 5))
+
+(defn cycle-progress-permille
+  "buf = [state-type estimate] × n。canceled は scope から外し、estimate 0
+  （未見積）は unestimated-weight で数える。不正な buffer は -1。"
+  [buf unestimated-weight]
+  (let [n (count buf)]
+    (if (odd? n)
+      -1
+      (loop [i 0 scope 0 done 0]
+        (if (< i n)
+          (let [t (nth buf i)
+                e (nth buf (inc i))]
+            (cond
+              (not (valid-type? t)) -1
+              (neg? e) -1
+              (= t 5) (recur (+ i 2) scope done)
+              :else (let [w (if (zero? e) unestimated-weight e)]
+                      (recur (+ i 2) (+ scope w) (if (= t 4) (+ done w) done)))))
+          (if (zero? scope) 0 (quot (* done 1000) scope)))))))
+
+(defn sla-status [now medium-at high-at breach-at]
+  (cond
+    (and (pos? breach-at) (>= now breach-at)) 3
+    (and (pos? high-at) (>= now high-at)) 2
+    (and (pos? medium-at) (>= now medium-at)) 1
+    :else 0))
+
+(defn next-number [buf]
+  (inc (reduce max 0 buf)))
+
+;; ───────── 時刻 ─────────
+
+(defn parse-time
+  "ISO-8601 → epoch ミリ秒。読めなければ nil。"
+  [s]
+  (when (and (string? s) (not (text/blank? s)))
+    #?(:cljs (let [t (.getTime (js/Date. s))] (when-not (js/isNaN t) t))
+       :clj (try (.toEpochMilli (java.time.Instant/parse s))
+                 (catch Exception _ nil)))))
+
+;; ───────── 状態名と型 ─────────
+
+(def ^:private state-type-hints
+  "既知でない状態名の型推定。先に当たったものを採る（canceled と completed を
+  started より先に見るのは \"Not started\" のような名前より、\"Done (QA)\" の
+  ような名前の方が多いから）。どれにも当たらなければ :backlog —— 推定を誤っても
+  進行中・完了に数えない側へ倒す。"
+  [[:canceled ["cancel" "duplicate" "won't" "wont" "reject" "declin" "obsolete"]]
+   [:completed ["done" "complete" "closed" "resolved" "released" "shipped" "merged" "fixed"]]
+   [:started ["progress" "review" "doing" "started" "qa" "testing" "blocked" "wip"]]
+   [:unstarted ["todo" "to do" "unstarted" "planned" "ready" "selected" "next"]]
+   [:triage ["triage" "inbox"]]
+   [:backlog ["backlog" "icebox" "someday"]]])
+
+(defn guess-state-type
+  "状態名だけから型を決める（Linear の CSV は状態の型を持たない）。"
+  [state-name]
+  (let [s (text/lower (or state-name ""))]
+    (or (some (fn [{:keys [name type]}] (when (= s (text/lower name)) type)) default-states)
+        (some (fn [[type hints]] (when (some #(text/includes? s %) hints) type))
+              state-type-hints)
+        :backlog)))
+
+(defn state-type-of
+  "team の状態定義を先に見て、無ければ名前から推定する。"
+  [team state-name]
+  (or (some (fn [{:keys [name type]}] (when (= name state-name) type)) (:states team))
+      (guess-state-type state-name)))
+
+;; ───────── db ─────────
+
+(def empty-db {:teams {} :issues {}})
+
+(defn new-team [k team-name]
+  {:key k
+   :name (if (text/blank? (or team-name "")) k team-name)
+   :states default-states
+   :estimation {:scale :notUsed :allow-zero? false :extended? false}})
+
+(defn valid-team-key? [k]
+  (boolean (and (string? k) (text/re-matches #"[A-Z][A-Z0-9]{0,6}" k))))
+
+(defn ensure-team [db k team-name]
+  (if (get-in db [:teams k])
+    db
+    (assoc-in db [:teams k] (new-team k team-name))))
+
+(defn team-issues [db k]
+  (filter #(= k (:team %)) (vals (:issues db))))
+
+(defn team-numbers [db k]
+  (vec (keep :number (team-issues db k))))
+
+(defn next-identifier [db k]
+  (str k "-" (next-number (team-numbers db k))))
+
+(defn sort-issues
+  "priority-rank 昇順（Urgent が先）、同じなら番号の新しい順。"
+  [issues]
+  (sort-by (juxt #(priority-rank (or (:priority %) 0)) #(- (or (:number %) 0)))
+           issues))
+
+(defn grouped-by-type
+  "[[type [issue …]] …]。並びは state-types の順で、空の型も含める。"
+  [issues]
+  (let [by (group-by :state-type issues)]
+    (mapv (fn [t] [t (vec (sort-issues (get by t)))]) state-types)))
+
+(defn- default-state [team]
+  (or (some #(when (= :unstarted (:type %)) %) (:states team))
+      (first (:states team))
+      {:name "Todo" :type :unstarted}))
+
+(defn create-issue
+  "新しい課題を作り、{:db :identifier} を返す。番号は next-number で採る。"
+  [db k attrs now]
+  (let [db (ensure-team db k nil)
+        team (get-in db [:teams k])
+        n (next-number (team-numbers db k))
+        id (str k "-" n)
+        st (default-state team)
+        issue (merge {:identifier id :team k :number n
+                      :title "" :description ""
+                      :state (:name st) :state-type (:type st)
+                      :priority 0 :estimate nil :labels [] :comments []
+                      :created-at now :updated-at now}
+                     attrs)]
+    {:db (assoc-in db [:issues id] issue) :identifier id}))
+
+(defn update-issue
+  "changes を merge し、:updated-at を now にする。状態は set-state で変える。"
+  [db id changes now]
+  (if (get-in db [:issues id])
+    (update-in db [:issues id] #(assoc (merge % changes) :updated-at now))
+    db))
+
+(defn set-state
+  "状態名を変える。transition-kind で時刻欄を動かす:
+  start → :started-at（未設定なら）、complete → :completed-at、
+  cancel → :canceled-at、reopen → :completed-at / :canceled-at を外す。"
+  [db id state-name now]
+  (if-let [issue (get-in db [:issues id])]
+    (let [team (get-in db [:teams (:team issue)])
+          to (state-type-of team state-name)
+          kind (transition-kind (state-type-code (:state-type issue))
+                                (state-type-code to))
+          issue' (cond-> (assoc issue :state state-name :state-type to :updated-at now)
+                   (and (#{1 4} kind) (= to :started) (nil? (:started-at issue)))
+                   (assoc :started-at now)
+                   (= kind 2) (assoc :completed-at now)
+                   (= kind 3) (assoc :canceled-at now)
+                   (= kind 4) (dissoc :completed-at :canceled-at))]
+      (assoc-in db [:issues id] issue'))
+    db))
+
+(defn delete-issue [db id]
+  (update db :issues dissoc id))
+
+(defn add-comment [db id body now]
+  (if (and (get-in db [:issues id]) (not (text/blank? (or body ""))))
+    (update-in db [:issues id :comments] (fnil conj []) {:body body :created-at now})
+    db))
+
+(defn set-estimation [db k changes]
+  (update-in db [:teams k :estimation] merge changes))
+
+(defn estimate-problem
+  "team の見積設定で estimate が許されないとき、その理由の文字列。許されれば nil。"
+  [team estimate]
+  (when (some? estimate)
+    (let [{:keys [scale allow-zero? extended?]} (:estimation team)]
+      (when (zero? (estimate-valid? (scale-code (or scale :notUsed)) estimate
+                                    (flag allow-zero?) (flag extended?)))
+        (if (= scale :notUsed)
+          "このチームは見積を使わない設定です"
+          (str estimate " は " (scale-label scale) " の見積値ではありません"))))))
+
+(defn infer-estimation
+  "取り込んだ見積値の集合から team の見積設定を推定する。値が無ければ :notUsed。
+  fibonacci → exponential → linear の順に、全値が通る最初の scale を採る。
+  どれも通らなければ fibonacci 拡張にし、通らない値は estimate-problem が示す。"
+  [estimates]
+  (let [vs (distinct (remove nil? estimates))
+        has-zero? (boolean (some #(= 0 %) vs))
+        fits (fn [scale extended]
+               (every? #(= 1 (estimate-valid? (scale-code scale) % (flag has-zero?) extended)) vs))]
+    (if (empty? vs)
+      {:scale :notUsed :allow-zero? false :extended? false}
+      (or (some (fn [[scale extended]]
+                  (when (fits scale extended)
+                    {:scale scale :allow-zero? has-zero? :extended? (= 1 extended)}))
+                [[:fibonacci 0] [:exponential 0] [:linear 0]
+                 [:fibonacci 1] [:exponential 1] [:linear 1]])
+          {:scale :fibonacci :allow-zero? has-zero? :extended? true}))))
+
+;; ───────── 集計 ─────────
+
+(defn progress-buffer
+  "issues → [state-type estimate] × n。未見積（nil）は 0。"
+  [issues]
+  (vec (mapcat (fn [i] [(state-type-code (:state-type i)) (or (:estimate i) 0)]) issues)))
+
+(defn cycle-progress
+  "{:permille :total :completed :canceled}。:permille は guest と同じ規則。"
+  [issues unestimated-weight]
+  {:permille (cycle-progress-permille (progress-buffer issues) unestimated-weight)
+   :total (count issues)
+   :completed (count (filter #(= :completed (:state-type %)) issues))
+   :canceled (count (filter #(= :canceled (:state-type %)) issues))})
+
+(defn cycles
+  "team の課題に現れるサイクル（番号の降順）。"
+  [issues]
+  (->> issues
+       (keep :cycle)
+       (filter :number)
+       (group-by :number)
+       (map (fn [[n cs]] (merge {:number n} (apply merge cs))))
+       (sort-by :number >)
+       vec))
+
+(defn issue-sla
+  "課題の SLA 段階（0 ok / 1 medium / 2 high / 3 breached）。"
+  [issue now-ms]
+  (let [t #(or (parse-time %) 0)
+        {:keys [medium-risk-at high-risk-at breaches-at]} (:sla issue)]
+    (sla-status now-ms (t medium-risk-at) (t high-risk-at) (t breaches-at))))
+
+;; ───────── 取り込みの merge ─────────
+
+(defn- ensure-state [db k state-name state-type]
+  (if (or (text/blank? (or state-name ""))
+          (some #(= state-name (:name %)) (get-in db [:teams k :states])))
+    db
+    (update-in db [:teams k :states] conj {:name state-name :type state-type})))
+
+(defn merge-import
+  "正規化済みの課題（dandori.ingest の出力）を db に入れる。
+  identifier が同じ課題は置き換え、identifier の無い課題には next-number で
+  番号を採る。新しい team は見積設定を取り込んだ値から推定する。
+  {:db :added :replaced} を返す。"
+  [db issues now]
+  (let [new-teams (->> issues
+                       (map :team-key)
+                       distinct
+                       (remove #(get-in db [:teams %])))
+        db (reduce (fn [db k]
+                     (let [nm (some #(when (= k (:team-key %)) (:team-name %)) issues)
+                           est (infer-estimation (keep #(when (= k (:team-key %)) (:estimate %)) issues))]
+                       (-> (ensure-team db k nm)
+                           (assoc-in [:teams k :estimation] est))))
+                   db new-teams)]
+    (reduce
+     (fn [{:keys [db] :as acc} issue]
+       (let [k (:team-key issue)
+             db (ensure-state db k (:state issue) (:state-type issue))
+             n (or (:number issue) (next-number (team-numbers db k)))
+             id (or (:identifier issue) (str k "-" n))
+             existed? (contains? (:issues db) id)
+             stored (-> (into {} (remove (comp nil? val)) issue)
+                        (dissoc :team-key :team-name)
+                        (assoc :identifier id :team k :number n)
+                        (update :labels #(vec (or % [])))
+                        (update :comments #(vec (or % [])))
+                        (update :created-at #(or % now))
+                        (update :updated-at #(or % now)))]
+         (-> acc
+             (assoc :db (assoc-in db [:issues id] stored))
+             (update (if existed? :replaced :added) inc))))
+     {:db db :added 0 :replaced 0}
+     issues)))
+
+;; ───────── サンプル ─────────
+
+(def sample-issues
+  "「サンプルを読み込む」で入れる合成データ（実在の人物・組織は含まない）。"
+  [{:team-key "DAN" :team-name "Dandori" :number 1 :identifier "DAN-1"
+    :title "取り込み画面に CSV の例を出す" :description "Linear の CSV エクスポートの列を例として示す。"
+    :state "Done" :state-type :completed :priority 3 :estimate 2 :labels ["docs"]
+    :cycle {:number 1 :name "Cycle 1"} :created-at "2026-10-01T09:00:00.000Z"
+    :updated-at "2026-10-03T09:00:00.000Z" :completed-at "2026-10-03T09:00:00.000Z"}
+   {:team-key "DAN" :team-name "Dandori" :number 2 :identifier "DAN-2"
+    :title "見積の scale を team 設定から選べるようにする" :description ""
+    :state "In Progress" :state-type :started :priority 2 :estimate 3 :labels ["feature"]
+    :cycle {:number 1 :name "Cycle 1"} :created-at "2026-10-02T09:00:00.000Z"
+    :updated-at "2026-10-04T09:00:00.000Z" :started-at "2026-10-04T09:00:00.000Z"}
+   {:team-key "DAN" :team-name "Dandori" :number 3 :identifier "DAN-3"
+    :title "SLA の期限切れを一覧で目立たせる" :description "breach を赤、high を橙で示す。"
+    :state "Todo" :state-type :unstarted :priority 1 :estimate 5 :labels ["feature" "sla"]
+    :cycle {:number 1 :name "Cycle 1"} :created-at "2026-10-02T10:00:00.000Z"
+    :updated-at "2026-10-02T10:00:00.000Z"
+    :sla {:medium-risk-at "2026-10-05T00:00:00.000Z" :high-risk-at "2026-10-06T00:00:00.000Z"
+          :breaches-at "2026-10-07T00:00:00.000Z"}}
+   {:team-key "DAN" :team-name "Dandori" :number 4 :identifier "DAN-4"
+    :title "古いエクスポート形式の対応" :description ""
+    :state "Canceled" :state-type :canceled :priority 4 :estimate 8 :labels []
+    :cycle {:number 1 :name "Cycle 1"} :created-at "2026-10-02T11:00:00.000Z"
+    :updated-at "2026-10-05T11:00:00.000Z" :canceled-at "2026-10-05T11:00:00.000Z"}
+   {:team-key "DAN" :team-name "Dandori" :number 5 :identifier "DAN-5"
+    :title "モバイル幅でボードを横スクロールにする" :description ""
+    :state "Triage" :state-type :triage :priority 0 :estimate nil :labels ["ui"]
+    :created-at "2026-10-06T09:00:00.000Z" :updated-at "2026-10-06T09:00:00.000Z"}])

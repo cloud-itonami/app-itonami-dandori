@@ -1,0 +1,242 @@
+(ns dandori.guest
+  "dandori 判断コア — aiueos guest（pure judgment, :effects #{}）。
+
+  Linear 互換の課題トラッキングのうち、**数で決まる判定だけ**を持つ:
+  優先度の並び順・見積値の妥当性・ワークフロー遷移の種類・サイクル進捗・
+  SLA の段階・課題番号の採番。文字列・I/O・永続化・同期はこの guest の外
+  （設計の正本: docs/aiueos-dapp.md）。
+
+  これは Linear の**データ形式**との互換であって、Linear の内部アルゴリズムの
+  再現ではない。サイクル進捗の数え方（canceled を scope から外し、未見積を
+  unestimated-weight で数える）は dandori が採る規則である。
+
+  符号化（Linear の値をそのまま整数にしたもの）:
+    state type  triage=0 backlog=1 unstarted=2 started=3 completed=4 canceled=5
+    priority    0=No priority 1=Urgent 2=High 3=Medium 4=Low
+    scale       notUsed=0 exponential=1 fibonacci=2 linear=3 tShirt=4
+                （tShirt は fibonacci の数で持つ: XS=1 S=2 M=3 L=5 XL=8、
+                  拡張 XXL=13 XXXL=21）
+
+  バッファ布局:
+    cycle-progress-permille  [state-type estimate] × n
+    next-number              課題番号 × n
+
+  test-* は test/fixtures/parity.edn の 73 行を関数ごとに 1 本へ写したもの
+  （priority-rank 7 / estimate-valid? 22 / closed? 5 / active? 3 /
+    transition-kind 14 / cycle-progress-permille 11 / sla-status 7 /
+    next-number 4）。表を変えたらここも変える。
+  test/dandori/parity_test.cljk がこの関数別件数を表と照合する。
+
+  テストはゼロ引数 `test-*`（戻り 1/0。true 返しは通らない）。実行:
+    <kotoba-lang>/amu/bin/amu test aiueos/dandori_core.cljk"
+  (:export [main priority-rank estimate-valid? closed? active? transition-kind
+            cycle-progress-permille sla-status next-number
+            test-priority-rank test-estimate-valid test-closed test-active
+            test-transition-kind test-cycle-progress test-sla-status
+            test-next-number]))
+
+(defn main [] :i64
+  0)
+
+;; --- 優先度 --------------------------------------------------------------
+
+(defn priority-rank [p :i64] :i64
+  (cond
+    (= p 1) 0
+    (= p 2) 1
+    (= p 3) 2
+    (= p 4) 3
+    (= p 0) 4
+    :else -1))
+
+;; --- 見積 ----------------------------------------------------------------
+
+(defn- exponential-member [v :i64 extended :i64] :i64
+  (cond
+    (or (= v 1) (= v 2) (= v 4) (= v 8) (= v 16)) 1
+    (and (= extended 1) (or (= v 32) (= v 64))) 1
+    :else 0))
+
+(defn- fibonacci-member [v :i64 extended :i64] :i64
+  (cond
+    (or (= v 1) (= v 2) (= v 3) (= v 5) (= v 8)) 1
+    (and (= extended 1) (or (= v 13) (= v 21))) 1
+    :else 0))
+
+(defn- linear-member [v :i64 extended :i64] :i64
+  (if (<= v (if (= extended 1) 7 5)) 1 0))
+
+(defn estimate-valid? [scale :i64 value :i64 allow-zero :i64 extended :i64] :i64
+  (cond
+    (= scale 0) 0
+    (< value 0) 0
+    (= value 0) (if (and (>= scale 1) (<= scale 4) (= allow-zero 1)) 1 0)
+    (= scale 1) (exponential-member value extended)
+    (= scale 2) (fibonacci-member value extended)
+    (= scale 3) (linear-member value extended)
+    (= scale 4) (fibonacci-member value extended)
+    :else 0))
+
+;; --- ワークフロー ----------------------------------------------------------
+
+(defn- valid-type [t :i64] :i64
+  (if (and (>= t 0) (<= t 5)) 1 0))
+
+(defn closed? [t :i64] :i64
+  (if (or (= t 4) (= t 5)) 1 0))
+
+(defn active? [t :i64] :i64
+  (if (= t 3) 1 0))
+
+(defn transition-kind [from :i64 to :i64] :i64
+  (cond
+    (= (valid-type from) 0) -1
+    (= (valid-type to) 0) -1
+    (= from to) 0
+    (= to 4) 2
+    (= to 5) 3
+    (= (closed? from) 1) 4
+    (= to 3) 1
+    :else 5))
+
+;; --- サイクル進捗: [state-type estimate] × n ----------------------------
+
+(defn cycle-progress-permille [buf :vector-i64 unestimated-weight :i64] :i64
+  (let [n (vector-count buf)]
+    (if (= n (* 2 (quot n 2)))
+      (cycle-progress-at buf n unestimated-weight 0 0 0)
+      -1)))
+
+(defn- cycle-progress-at [buf :vector-i64 n :i64 w :i64 i :i64 scope :i64 done :i64] :i64
+  (if (< i n)
+    (let [t (vector-at buf i)
+          e (vector-at buf (+ i 1))]
+      (cond
+        (= (valid-type t) 0) -1
+        (< e 0) -1
+        (= t 5) (cycle-progress-at buf n w (+ i 2) scope done)
+        :else (let [weight (if (= e 0) w e)]
+                (cycle-progress-at buf n w (+ i 2)
+                                   (+ scope weight)
+                                   (if (= t 4) (+ done weight) done)))))
+    (if (= scope 0)
+      0
+      (quot (* done 1000) scope))))
+
+;; --- SLA -----------------------------------------------------------------
+
+(defn sla-status [now :i64 medium-at :i64 high-at :i64 breach-at :i64] :i64
+  (cond
+    (and (> breach-at 0) (>= now breach-at)) 3
+    (and (> high-at 0) (>= now high-at)) 2
+    (and (> medium-at 0) (>= now medium-at)) 1
+    :else 0))
+
+;; --- 採番 ----------------------------------------------------------------
+
+(defn next-number [buf :vector-i64] :i64
+  (+ (max-number buf (vector-count buf) 0 0) 1))
+
+(defn- max-number [buf :vector-i64 n :i64 i :i64 best :i64] :i64
+  (if (< i n)
+    (max-number buf n (+ i 1) (max best (vector-at buf i)))
+    best))
+
+;; --- tests（戻り 1 = pass。test/fixtures/parity.edn の行を写す） -----------
+
+(defn test-priority-rank [] :i64
+  (if (and (= (priority-rank 1) 0)
+           (= (priority-rank 2) 1)
+           (= (priority-rank 3) 2)
+           (= (priority-rank 4) 3)
+           (= (priority-rank 0) 4)
+           (= (priority-rank 5) -1)
+           (= (priority-rank -1) -1))
+    1 0))
+
+(defn test-estimate-valid [] :i64
+  (if (and (= (estimate-valid? 1 8 0 0) 1)
+           (= (estimate-valid? 1 3 0 0) 0)
+           (= (estimate-valid? 1 32 0 0) 0)
+           (= (estimate-valid? 1 32 0 1) 1)
+           (= (estimate-valid? 1 64 0 1) 1)
+           (= (estimate-valid? 2 5 0 0) 1)
+           (= (estimate-valid? 2 4 0 0) 0)
+           (= (estimate-valid? 2 13 0 0) 0)
+           (= (estimate-valid? 2 21 0 1) 1)
+           (= (estimate-valid? 3 5 0 0) 1)
+           (= (estimate-valid? 3 6 0 0) 0)
+           (= (estimate-valid? 3 7 0 1) 1)
+           (= (estimate-valid? 3 8 0 1) 0)
+           (= (estimate-valid? 4 8 0 0) 1)
+           (= (estimate-valid? 4 13 0 1) 1)
+           (= (estimate-valid? 4 4 0 1) 0)
+           (= (estimate-valid? 2 0 0 0) 0)
+           (= (estimate-valid? 2 0 1 0) 1)
+           (= (estimate-valid? 0 0 1 1) 0)
+           (= (estimate-valid? 0 1 0 0) 0)
+           (= (estimate-valid? 2 -1 1 1) 0)
+           (= (estimate-valid? 9 1 0 0) 0))
+    1 0))
+
+(defn test-closed [] :i64
+  (if (and (= (closed? 4) 1)
+           (= (closed? 5) 1)
+           (= (closed? 3) 0)
+           (= (closed? 0) 0)
+           (= (closed? 7) 0))
+    1 0))
+
+(defn test-active [] :i64
+  (if (and (= (active? 3) 1)
+           (= (active? 2) 0)
+           (= (active? 4) 0))
+    1 0))
+
+(defn test-transition-kind [] :i64
+  (if (and (= (transition-kind 2 2) 0)
+           (= (transition-kind 2 3) 1)
+           (= (transition-kind 1 3) 1)
+           (= (transition-kind 3 4) 2)
+           (= (transition-kind 0 4) 2)
+           (= (transition-kind 3 5) 3)
+           (= (transition-kind 4 5) 3)
+           (= (transition-kind 4 2) 4)
+           (= (transition-kind 5 3) 4)
+           (= (transition-kind 5 0) 4)
+           (= (transition-kind 0 1) 5)
+           (= (transition-kind 3 2) 5)
+           (= (transition-kind 6 2) -1)
+           (= (transition-kind 2 -1) -1))
+    1 0))
+
+(defn test-cycle-progress [] :i64
+  (if (and (= (cycle-progress-permille [] 1) 0)
+           (= (cycle-progress-permille [4 3 3 2 2 5] 1) 300)
+           (= (cycle-progress-permille [4 3 5 8 3 1] 1) 750)
+           (= (cycle-progress-permille [4 0 2 0 2 0] 1) 333)
+           (= (cycle-progress-permille [4 0 2 2] 0) 0)
+           (= (cycle-progress-permille [4 0 2 2] 2) 500)
+           (= (cycle-progress-permille [5 3 5 2] 1) 0)
+           (= (cycle-progress-permille [4 1 4 2] 1) 1000)
+           (= (cycle-progress-permille [4 3 2] 1) -1)
+           (= (cycle-progress-permille [4 -1] 1) -1)
+           (= (cycle-progress-permille [9 1] 1) -1))
+    1 0))
+
+(defn test-sla-status [] :i64
+  (if (and (= (sla-status 100 0 0 0) 0)
+           (= (sla-status 100 200 300 400) 0)
+           (= (sla-status 200 200 300 400) 1)
+           (= (sla-status 350 200 300 400) 2)
+           (= (sla-status 400 200 300 400) 3)
+           (= (sla-status 500 0 0 400) 3)
+           (= (sla-status 350 0 300 0) 2))
+    1 0))
+
+(defn test-next-number [] :i64
+  (if (and (= (next-number []) 1)
+           (= (next-number [1 2 3]) 4)
+           (= (next-number [7 2 41]) 42)
+           (= (next-number [-5 0]) 1))
+    1 0))

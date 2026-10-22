@@ -1,0 +1,159 @@
+(ns dandori.export
+  "db → Linear 互換の書き出し。2 形式とも dandori.ingest がそのまま読み戻せる
+  （往復で値が変わらないことを test/dandori/roundtrip_test.cljk が確かめる）。
+
+  - **GraphQL JSON**: `{\"data\":{\"issues\":{\"nodes\":[…]}}}`。Linear の
+    Issue 型のフィールド名（identifier・state{name type}・labels{nodes}・
+    slaBreachesAt …）で書く。ローカルのコメントも comments{nodes} に入れる。
+  - **CSV**: Linear の CSV エクスポートと同じ見出し名。最後に dandori 独自の
+    `Status Type` 列を足す —— Linear の CSV は状態の型を持たないので、これが
+    無いと独自の状態名（\"QA\" など）の型が読み戻しで推定に落ちる。Linear 側の
+    取り込みは知らない列を無視するので、足しても互換は崩れない。
+
+  JSON は自前で書く（キーの順序を固定し、差分が読める出力にするため）。"
+  (:require [kotoba.lang.text :as text]
+            [dandori.core :as core]))
+
+;; ───────── JSON writer ─────────
+
+(defn- code-unit [c]
+  #?(:cljs (.charCodeAt c 0) :clj (int (.charAt ^String c 0))))
+
+(defn- hex4 [n]
+  (let [h (text/lower #?(:cljs (.toString n 16) :clj (Integer/toHexString n)))]
+    (str (apply str (repeat (- 4 (count h)) "0")) h)))
+
+(defn- escape-char [ch]
+  (let [c (str ch)]
+    (case c
+      "\"" "\\\""
+      "\\" "\\\\"
+      "\n" "\\n"
+      "\r" "\\r"
+      "\t" "\\t"
+      (if (< (code-unit c) 32) (str "\\u" (hex4 (code-unit c))) c))))
+
+(defn- json-string [s]
+  (str "\""
+       (if (text/re-find #"[\"\\\u0000-\u001f]" s)
+         (apply str (map escape-char s))
+         s)
+       "\""))
+
+(declare json)
+
+(defn- json-object
+  "pairs は [[k v] …]。順序はこの並びのまま。"
+  [pairs indent]
+  (if (empty? pairs)
+    "{}"
+    (let [pad (apply str (repeat (+ indent 2) " "))]
+      (str "{\n"
+           (text/join ",\n" (map (fn [[k v]] (str pad (json-string (name k)) ": " (json v (+ indent 2))))
+                                 pairs))
+           "\n" (apply str (repeat indent " ")) "}"))))
+
+(defn json
+  "値 → JSON 文字列。map は (seq m) の順で書く（順序を保ちたいときは
+  ordered を使う）。"
+  ([v] (json v 0))
+  ([v indent]
+   (cond
+     (nil? v) "null"
+     (true? v) "true"
+     (false? v) "false"
+     (string? v) (json-string v)
+     (keyword? v) (json-string (name v))
+     (number? v) (str v)
+     (and (map? v) (::pairs (meta v))) (json-object (::pairs (meta v)) indent)
+     (map? v) (json-object (seq v) indent)
+     (sequential? v)
+     (if (empty? v)
+       "[]"
+       (let [pad (apply str (repeat (+ indent 2) " "))]
+         (str "[\n" (text/join ",\n" (map #(str pad (json % (+ indent 2))) v))
+              "\n" (apply str (repeat indent " ")) "]")))
+     :else (json-string (str v)))))
+
+(defn- ordered
+  "[[k v] …] から nil 値を除き、書き出し順を保った map を作る。"
+  [pairs]
+  (let [pairs (vec (remove (comp nil? second) pairs))]
+    (with-meta (into {} pairs) {::pairs pairs})))
+
+;; ───────── GraphQL JSON ─────────
+
+(defn- named [x] (when x (ordered [["name" x]])))
+
+(defn issue-node [db issue]
+  (let [team (get-in db [:teams (:team issue)])
+        {:keys [medium-risk-at high-risk-at breaches-at]} (:sla issue)]
+    (ordered
+     [["identifier" (:identifier issue)]
+      ["number" (:number issue)]
+      ["title" (:title issue)]
+      ["description" (:description issue)]
+      ["priority" (:priority issue)]
+      ["priorityLabel" (core/priority-label (:priority issue))]
+      ["estimate" (:estimate issue)]
+      ["state" (ordered [["name" (:state issue)] ["type" (some-> (:state-type issue) name)]])]
+      ["team" (ordered [["key" (:team issue)] ["name" (:name team)]])]
+      ["labels" (ordered [["nodes" (mapv named (:labels issue))]])]
+      ["assignee" (named (:assignee issue))]
+      ["creator" (named (:creator issue))]
+      ["project" (named (:project issue))]
+      ["cycle" (when-let [c (:cycle issue)] (ordered [["number" (:number c)] ["name" (:name c)]]))]
+      ["dueDate" (:due-date issue)]
+      ["parent" (when-let [p (:parent issue)] (ordered [["identifier" p]]))]
+      ["createdAt" (:created-at issue)]
+      ["updatedAt" (:updated-at issue)]
+      ["startedAt" (:started-at issue)]
+      ["completedAt" (:completed-at issue)]
+      ["canceledAt" (:canceled-at issue)]
+      ["slaMediumRiskAt" medium-risk-at]
+      ["slaHighRiskAt" high-risk-at]
+      ["slaBreachesAt" breaches-at]
+      ["comments" (ordered [["nodes" (mapv (fn [c] (ordered [["body" (:body c)] ["createdAt" (:created-at c)]]))
+                                           (:comments issue))]])]])))
+
+(defn- export-order [db issues]
+  (sort-by (juxt :team :number) issues))
+
+(defn graphql-json
+  "db（または team key で絞った課題）→ GraphQL 形の JSON 文字列。"
+  ([db] (graphql-json db (vals (:issues db))))
+  ([db issues]
+   (json (ordered [["data" (ordered [["issues" (ordered [["nodes" (mapv #(issue-node db %)
+                                                                         (export-order db issues))]])]])]]))))
+
+;; ───────── CSV ─────────
+
+(def csv-headers
+  ["ID" "Team" "Title" "Description" "Status" "Estimate" "Priority" "Project"
+   "Creator" "Assignee" "Labels" "Cycle Number" "Cycle Name" "Created" "Updated"
+   "Started" "Completed" "Canceled" "Due Date" "Parent issue" "Status Type"])
+
+(defn- csv-field [v]
+  (let [s (if (nil? v) "" (str v))]
+    (if (text/re-find #"[\",\r\n]" s)
+      (str "\"" (text/replace s "\"" "\"\"") "\"")
+      s)))
+
+(defn- csv-row [db issue]
+  (let [team (get-in db [:teams (:team issue)])]
+    [(:identifier issue) (:name team) (:title issue) (:description issue)
+     (:state issue) (:estimate issue) (core/priority-label (:priority issue))
+     (:project issue) (:creator issue) (:assignee issue)
+     (text/join ", " (:labels issue))
+     (get-in issue [:cycle :number]) (get-in issue [:cycle :name])
+     (:created-at issue) (:updated-at issue) (:started-at issue)
+     (:completed-at issue) (:canceled-at issue) (:due-date issue)
+     (:parent issue) (some-> (:state-type issue) name)]))
+
+(defn csv
+  "db → Linear 形の CSV 文字列（行末 \\n、最後の行にも \\n）。"
+  ([db] (csv db (vals (:issues db))))
+  ([db issues]
+   (str (text/join "\n" (map #(text/join "," (map csv-field %))
+                             (cons csv-headers (map #(csv-row db %) (export-order db issues)))))
+        "\n")))

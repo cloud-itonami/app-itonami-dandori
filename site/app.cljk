@@ -1,0 +1,248 @@
+;; dandori のブラウザ側。scittle が読む（site/site.edn の :sources の最後）。
+;;
+;; Re-frame が状態・event・subscription・effect を持ち、Reagent が描く
+;; （cloud-itonami ADR-0052）。画面は dandori.view の純関数で、SSR と同じもの。
+;; DOM を直接いじるのは effect（保存・ダウンロード・ファイル読み込み・時計）
+;; の中だけ。
+;;
+;; ネットワークは使わない。fetch も XHR も無い。保存はこの端末の localStorage
+;; だけで、読み書きは try で囲む（プライベートウィンドウ等で失敗しても動く）。
+
+;; ns を宣言する —— scittle は各 script を同じ SCI 文脈で順に評価するので、
+;; 宣言しないと直前の script（dandori.view）の ns のまま評価される。
+(ns dandori.app
+  (:require [clojure.edn :as edn]
+            [reagent.dom :as rdom]
+            [re-frame.core :as rf]
+            [kotoba.lang.text :as text]
+            [dandori.core :as core]
+            [dandori.ingest :as ingest]
+            [dandori.export :as export]
+            [dandori.view :as view]))
+
+(def storage-key "itonami.dandori.v1")
+
+;; ───────── effects / coeffects ─────────
+
+(rf/reg-cofx
+ ::stored
+ (fn [cofx _]
+   (assoc cofx ::stored
+          (try
+            (some-> (.getItem js/localStorage storage-key) edn/read-string)
+            (catch :default _ nil)))))
+
+(rf/reg-cofx
+ ::now
+ (fn [cofx _]
+   (let [d (js/Date.)]
+     (assoc cofx ::now {:iso (.toISOString d) :ms (.getTime d)}))))
+
+(rf/reg-fx
+ ::store
+ (fn [data]
+   (try
+     (if data
+       (.setItem js/localStorage storage-key (pr-str data))
+       (.removeItem js/localStorage storage-key))
+     (catch :default _ nil))))
+
+(rf/reg-fx
+ ::download
+ (fn [{:keys [filename mime body]}]
+   (let [blob (js/Blob. #js [body] #js {:type mime})
+         url (.createObjectURL js/URL blob)
+         a (.createElement js/document "a")]
+     (set! (.-href a) url)
+     (set! (.-download a) filename)
+     (.click a)
+     (js/setTimeout #(.revokeObjectURL js/URL url) 1000))))
+
+(rf/reg-fx
+ ::read-file
+ (fn [file]
+   (when file
+     (let [reader (js/FileReader.)]
+       (set! (.-onload reader) #(rf/dispatch [:set-import-text (.-result reader)]))
+       (.readAsText reader file)))))
+
+(rf/reg-fx
+ ::clock
+ (fn [_]
+   (js/setInterval #(rf/dispatch [:tick (.now js/Date)]) 60000)))
+
+;; ───────── events ─────────
+
+(defn- first-team [data] (first (sort (keys (:teams data)))))
+
+(rf/reg-event-fx
+ :init
+ [(rf/inject-cofx ::stored) (rf/inject-cofx ::now)]
+ (fn [{stored ::stored now ::now} _]
+   (let [data (if (map? stored) (merge core/empty-db stored) core/empty-db)]
+     {:db {:data data
+           :ui (assoc view/initial-ui :team (first-team data))
+           :now-ms (:ms now)}
+      ::clock true})))
+
+(rf/reg-event-db :tick (fn [db [_ ms]] (assoc db :now-ms ms)))
+
+(defn- reg-data-event
+  "data を変える event。handler は (fn [db event now-iso] db')。
+  変えた data を ::store effect で保存する（handler 自身は純関数のまま）。"
+  [id f]
+  (rf/reg-event-fx
+   id
+   [(rf/inject-cofx ::now)]
+   (fn [{:keys [db] now ::now} event]
+     (let [db' (f db event (:iso now))]
+       (cond-> {:db db'}
+         (not= (:data db) (:data db')) (assoc ::store (:data db')))))))
+
+(defn- reg-ui-event [id f]
+  (rf/reg-event-db id (fn [db event] (f db event))))
+
+(reg-ui-event :select-team (fn [db [_ k]] (update db :ui assoc :team k :issue nil :cycle nil)))
+(reg-ui-event :select-issue (fn [db [_ id]] (update db :ui assoc :issue id :comment-draft "")))
+(reg-ui-event :select-cycle (fn [db [_ v]] (assoc-in db [:ui :cycle] (parse-long v))))
+(reg-ui-event :set-mode (fn [db [_ m]] (assoc-in db [:ui :mode] m)))
+(reg-ui-event :toggle-import (fn [db _] (update-in db [:ui :import-open?] not)))
+(reg-ui-event :set-import-text (fn [db [_ v]] (assoc-in db [:ui :import-text] v)))
+(reg-ui-event :dismiss-result (fn [db _] (assoc-in db [:ui :import-result] nil)))
+(reg-ui-event :set-comment-draft (fn [db [_ v]] (assoc-in db [:ui :comment-draft] v)))
+(reg-ui-event :ask-clear (fn [db _] (assoc-in db [:ui :confirm-clear?] true)))
+(reg-ui-event :cancel-clear (fn [db _] (assoc-in db [:ui :confirm-clear?] false)))
+(reg-ui-event :set-new-team
+              (fn [db [_ field v]]
+                (assoc-in db [:ui :new-team field] (if (= field :key) (text/upper v) v))))
+
+(rf/reg-event-fx :import-file (fn [_ [_ file]] {::read-file file}))
+
+(reg-data-event
+ :run-import
+ (fn [db _ now]
+   (let [{:keys [format issues warnings]} (ingest/ingest (get-in db [:ui :import-text]))
+         {data :db :keys [added replaced]} (core/merge-import (:data db) issues now)]
+     (-> db
+         (assoc :data data)
+         (update :ui assoc
+                 :import-result {:format format :added added :replaced replaced :warnings warnings}
+                 :import-open? (empty? issues)
+                 :import-text (if (seq issues) "" (get-in db [:ui :import-text]))
+                 :team (or (get-in db [:ui :team])
+                           (:team-key (first issues))
+                           (first-team data)))))))
+
+(reg-data-event
+ :load-sample
+ (fn [db _ now]
+   (let [{data :db} (core/merge-import (:data db) core/sample-issues now)]
+     (-> db (assoc :data data) (assoc-in [:ui :team] "DAN")))))
+
+(reg-data-event
+ :create-team
+ (fn [db _ _]
+   (let [{k :key nm :name} (get-in db [:ui :new-team])]
+     (if (core/valid-team-key? k)
+       (-> db
+           (update :data core/ensure-team k nm)
+           (update :ui assoc :team k :new-team {:key "" :name ""}))
+       db))))
+
+(reg-data-event
+ :create-issue
+ (fn [db _ now]
+   (if-let [k (get-in db [:ui :team])]
+     (let [{data :db id :identifier} (core/create-issue (:data db) k {} now)]
+       (-> db (assoc :data data) (assoc-in [:ui :issue] id)))
+     db)))
+
+(defn- parse-field [field v]
+  (case field
+    :priority (or (parse-long (str v)) 0)
+    :estimate (when-not (text/blank? (str v)) (parse-long (str v)))
+    :labels (vec (keep #(let [s (text/trim %)] (when-not (text/blank? s) s))
+                       (text/split (str v) #",")))
+    :cycle (when-let [n (parse-long (text/trim (str v)))] {:number n :name (str "Cycle " n)})
+    (:due-date :assignee) (when-not (text/blank? (str v)) v)
+    v))
+
+(reg-data-event
+ :edit-issue
+ (fn [db [_ id field v] now]
+   (let [value (parse-field field v)
+         data (:data db)
+         ;; サイクル名は既に同じ番号のサイクルがあればその名前を使う
+         value (if (and (= field :cycle) value)
+                 (or (some #(when (= (:number value) (:number %)) %)
+                           (core/cycles (core/team-issues data (get-in data [:issues id :team]))))
+                     value)
+                 value)]
+     (update db :data core/update-issue id
+             (if (nil? value) {field nil} {field value})
+             now))))
+
+(reg-data-event
+ :set-state
+ (fn [db [_ id state-name] now]
+   (update db :data core/set-state id state-name now)))
+
+(reg-data-event
+ :add-comment
+ (fn [db [_ id] now]
+   (-> db
+       (update :data core/add-comment id (get-in db [:ui :comment-draft]) now)
+       (assoc-in [:ui :comment-draft] ""))))
+
+(reg-data-event
+ :delete-issue
+ (fn [db [_ id] _]
+   (-> db
+       (update :data core/delete-issue id)
+       (assoc-in [:ui :issue] nil))))
+
+(reg-data-event
+ :set-estimation
+ (fn [db [_ field v] _]
+   (if-let [k (get-in db [:ui :team])]
+     (update db :data core/set-estimation k {field (if (= field :scale) (keyword v) (boolean v))})
+     db)))
+
+(reg-data-event
+ :clear-all
+ (fn [db _ _]
+   (assoc db :data core/empty-db :ui view/initial-ui)))
+
+(rf/reg-event-fx
+ :export
+ (fn [{:keys [db]} [_ fmt]]
+   (let [data (:data db)
+         stamp (subs (.toISOString (js/Date.)) 0 10)]
+     {::download (case fmt
+                   :json {:filename (str "dandori-issues-" stamp ".json")
+                          :mime "application/json"
+                          :body (export/graphql-json data)}
+                   :csv {:filename (str "dandori-issues-" stamp ".csv")
+                         :mime "text/csv"
+                         :body (export/csv data)})})))
+
+;; ───────── subscription / 描画 ─────────
+
+(rf/reg-sub :state (fn [db _] db))
+
+(defn- handlers
+  "dandori.view の h。ev は re-frame の event ベクタ。"
+  [kind ev]
+  (case kind
+    :click (fn [_] (rf/dispatch ev))
+    :value (fn [e] (rf/dispatch (conj ev (.. e -target -value))))
+    :checked (fn [e] (rf/dispatch (conj ev (.. e -target -checked))))
+    :file (fn [e] (rf/dispatch (conj ev (aget (.. e -target -files) 0))))
+    nil))
+
+(defn root []
+  (let [state @(rf/subscribe [:state])]
+    (view/root state handlers)))
+
+(rf/dispatch-sync [:init])
+(rdom/render [root] (.getElementById js/document "app"))

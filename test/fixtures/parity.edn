@@ -1,0 +1,101 @@
+;; dandori の parity fixture — guest（aiueos/dandori_core.cljk）と adapter
+;; （src/dandori/core.cljk）が同じ入力に同じ i64 を返すことの表。
+;;
+;; 3 か所がこの表を読む / 写す:
+;;   1. test/dandori/parity_test.cljk   — adapter で全行を照合する（kbb）
+;;   2. aiueos/dandori_core.cljk の test-* — 同じ行を手で写す（amu test、3 target）
+;;   3. test/guest_parity.mjs            — 同じ表を wasm（kototama-browser-host-v1）で回す
+;;
+;; 行を足したら 2 も足す。件数は parity_test が数えて guest の docstring と照合する。
+;;
+;; 符号化:
+;;   state type  triage=0 backlog=1 unstarted=2 started=3 completed=4 canceled=5
+;;   priority    0=No priority 1=Urgent 2=High 3=Medium 4=Low
+;;   scale       notUsed=0 exponential=1 fibonacci=2 linear=3 tShirt=4
+[;; priority-rank — urgent が先頭、No priority が末尾、範囲外は -1
+ {:fn "priority-rank" :args [1] :expect 0}
+ {:fn "priority-rank" :args [2] :expect 1}
+ {:fn "priority-rank" :args [3] :expect 2}
+ {:fn "priority-rank" :args [4] :expect 3}
+ {:fn "priority-rank" :args [0] :expect 4}
+ {:fn "priority-rank" :args [5] :expect -1}
+ {:fn "priority-rank" :args [-1] :expect -1}
+
+ ;; estimate-valid? [scale value allow-zero extended]
+ {:fn "estimate-valid?" :args [1 8 0 0] :expect 1}
+ {:fn "estimate-valid?" :args [1 3 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [1 32 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [1 32 0 1] :expect 1}
+ {:fn "estimate-valid?" :args [1 64 0 1] :expect 1}
+ {:fn "estimate-valid?" :args [2 5 0 0] :expect 1}
+ {:fn "estimate-valid?" :args [2 4 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [2 13 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [2 21 0 1] :expect 1}
+ {:fn "estimate-valid?" :args [3 5 0 0] :expect 1}
+ {:fn "estimate-valid?" :args [3 6 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [3 7 0 1] :expect 1}
+ {:fn "estimate-valid?" :args [3 8 0 1] :expect 0}
+ {:fn "estimate-valid?" :args [4 8 0 0] :expect 1}
+ {:fn "estimate-valid?" :args [4 13 0 1] :expect 1}
+ {:fn "estimate-valid?" :args [4 4 0 1] :expect 0}
+ {:fn "estimate-valid?" :args [2 0 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [2 0 1 0] :expect 1}
+ {:fn "estimate-valid?" :args [0 0 1 1] :expect 0}
+ {:fn "estimate-valid?" :args [0 1 0 0] :expect 0}
+ {:fn "estimate-valid?" :args [2 -1 1 1] :expect 0}
+ {:fn "estimate-valid?" :args [9 1 0 0] :expect 0}
+
+ ;; closed? / active?
+ {:fn "closed?" :args [4] :expect 1}
+ {:fn "closed?" :args [5] :expect 1}
+ {:fn "closed?" :args [3] :expect 0}
+ {:fn "closed?" :args [0] :expect 0}
+ {:fn "closed?" :args [7] :expect 0}
+ {:fn "active?" :args [3] :expect 1}
+ {:fn "active?" :args [2] :expect 0}
+ {:fn "active?" :args [4] :expect 0}
+
+ ;; transition-kind [from to] — 0 no-op 1 start 2 complete 3 cancel 4 reopen 5 other、範囲外 -1
+ {:fn "transition-kind" :args [2 2] :expect 0}
+ {:fn "transition-kind" :args [2 3] :expect 1}
+ {:fn "transition-kind" :args [1 3] :expect 1}
+ {:fn "transition-kind" :args [3 4] :expect 2}
+ {:fn "transition-kind" :args [0 4] :expect 2}
+ {:fn "transition-kind" :args [3 5] :expect 3}
+ {:fn "transition-kind" :args [4 5] :expect 3}
+ {:fn "transition-kind" :args [4 2] :expect 4}
+ {:fn "transition-kind" :args [5 3] :expect 4}
+ {:fn "transition-kind" :args [5 0] :expect 4}
+ {:fn "transition-kind" :args [0 1] :expect 5}
+ {:fn "transition-kind" :args [3 2] :expect 5}
+ {:fn "transition-kind" :args [6 2] :expect -1}
+ {:fn "transition-kind" :args [2 -1] :expect -1}
+
+ ;; cycle-progress-permille [[type estimate]×n unestimated-weight]
+ ;; canceled は scope から外す。estimate 0 は unestimated-weight で数える。不正な buffer は -1。
+ {:fn "cycle-progress-permille" :args [[] 1] :expect 0}
+ {:fn "cycle-progress-permille" :args [[4 3 3 2 2 5] 1] :expect 300}
+ {:fn "cycle-progress-permille" :args [[4 3 5 8 3 1] 1] :expect 750}
+ {:fn "cycle-progress-permille" :args [[4 0 2 0 2 0] 1] :expect 333}
+ {:fn "cycle-progress-permille" :args [[4 0 2 2] 0] :expect 0}
+ {:fn "cycle-progress-permille" :args [[4 0 2 2] 2] :expect 500}
+ {:fn "cycle-progress-permille" :args [[5 3 5 2] 1] :expect 0}
+ {:fn "cycle-progress-permille" :args [[4 1 4 2] 1] :expect 1000}
+ {:fn "cycle-progress-permille" :args [[4 3 2] 1] :expect -1}
+ {:fn "cycle-progress-permille" :args [[4 -1] 1] :expect -1}
+ {:fn "cycle-progress-permille" :args [[9 1] 1] :expect -1}
+
+ ;; sla-status [now medium-at high-at breach-at] — 0 は「未設定」
+ {:fn "sla-status" :args [100 0 0 0] :expect 0}
+ {:fn "sla-status" :args [100 200 300 400] :expect 0}
+ {:fn "sla-status" :args [200 200 300 400] :expect 1}
+ {:fn "sla-status" :args [350 200 300 400] :expect 2}
+ {:fn "sla-status" :args [400 200 300 400] :expect 3}
+ {:fn "sla-status" :args [500 0 0 400] :expect 3}
+ {:fn "sla-status" :args [350 0 300 0] :expect 2}
+
+ ;; next-number — 最大 + 1、空なら 1
+ {:fn "next-number" :args [[]] :expect 1}
+ {:fn "next-number" :args [[1 2 3]] :expect 4}
+ {:fn "next-number" :args [[7 2 41]] :expect 42}
+ {:fn "next-number" :args [[-5 0]] :expect 1}]

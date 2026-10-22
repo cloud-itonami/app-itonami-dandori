@@ -1,0 +1,21 @@
+(ns run-tests
+  "kbb 実行のテスト runner（npm test から呼ばれる）。kaikei の
+  appview/.../cljs/test/run_tests.cljk と同じ形: cljs.test を回し、失敗か
+  エラーがあれば exitCode を 1 にする。
+
+  classpath（west レイアウト、repo ルートで）:
+    kbb --backend sci --classpath src:test:../../kotoba-lang/text/src test/run_tests.cljk"
+  (:require [cljs.test :refer [run-tests]]
+            [dandori.parity-test]
+            [dandori.core-test]
+            [dandori.ingest-test]
+            [dandori.roundtrip-test]
+            [dandori.view-test]))
+
+(let [{:keys [fail error]} (run-tests 'dandori.parity-test
+                                      'dandori.core-test
+                                      'dandori.ingest-test
+                                      'dandori.roundtrip-test
+                                      'dandori.view-test)]
+  (when (pos? (+ fail error))
+    (set! (.-exitCode js/process) 1)))

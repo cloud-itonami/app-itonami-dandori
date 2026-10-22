@@ -1,0 +1,26 @@
+{:itonami.blueprint/id "app-itonami-dandori"
+ :itonami.blueprint/name "dandori — Linear-compatible issue tracking, browser-local"
+ :itonami.blueprint/domain :software/issue-tracking
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:data-sovereignty :self-hosting :vendor-lock-in-exit]
+ :itonami.blueprint/robotics false
+ :itonami.blueprint/required-technologies [:wasm-guest :browser-local-state]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :core-only
+ ;; app.itonami.cloud/dandori/（network-awai/cloud-itonami の sites.edn、app org）。
+ ;; :endpoint は書かない —— 静的配信の道具で、呼び出せる actor ではない。書くと
+ ;; fleet catalog が callable だと嘘をつく。
+ :itonami.blueprint/org "app"
+ :itonami.blueprint/compat
+ {:target "Linear"
+  :scope :data-format
+  :network false
+  :formats [:linear-csv-export :linear-graphql-issues-json]
+  :note "本家 API へは接続しない（kotoba-client-runtime ブローカー未着地）。互換はデータ形式の互換で、Linear の内部アルゴリズムの再現ではない。"}
+ :itonami.blueprint/implementation
+ {:language :kotoba
+  :target :wasm32-browser-kotoba-v1
+  :guest "aiueos/dandori_core.cljk"
+  :descriptor "aiueos/dandori.edn"
+  :ui :scittle-re-frame-reagent
+  :capabilities []}}

@@ -1,0 +1,48 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "identifier": "OPS-41",
+          "number": 41,
+          "title": "Rotate staging certificates",
+          "description": "Expires on the 30th.",
+          "priority": 1,
+          "priorityLabel": "Urgent",
+          "estimate": 8,
+          "state": { "name": "Todo", "type": "unstarted" },
+          "team": { "key": "OPS", "name": "Operations" },
+          "labels": { "nodes": [ { "name": "infra" }, { "name": "security" } ] },
+          "assignee": { "name": "Dana Example" },
+          "creator": { "name": "Erin Example" },
+          "project": null,
+          "cycle": { "number": 12, "name": "Cycle 12" },
+          "dueDate": "2026-10-30",
+          "parent": null,
+          "createdAt": "2026-10-10T08:00:00.000Z",
+          "updatedAt": "2026-10-11T08:00:00.000Z",
+          "startedAt": null,
+          "completedAt": null,
+          "canceledAt": null,
+          "slaMediumRiskAt": "2026-10-20T00:00:00.000Z",
+          "slaHighRiskAt": "2026-10-25T00:00:00.000Z",
+          "slaBreachesAt": "2026-10-30T00:00:00.000Z",
+          "comments": { "nodes": [ { "body": "Owner confirmed.", "createdAt": "2026-10-11T08:00:00.000Z" } ] }
+        },
+        {
+          "identifier": "OPS-42",
+          "title": "Decommission old runner",
+          "priority": 4,
+          "estimate": 16,
+          "state": { "name": "Shipped to prod", "type": "completed" },
+          "team": { "key": "OPS", "name": "Operations" },
+          "labels": { "nodes": [] },
+          "cycle": { "number": 12, "name": "Cycle 12" },
+          "createdAt": "2026-10-01T08:00:00.000Z",
+          "updatedAt": "2026-10-09T08:00:00.000Z",
+          "completedAt": "2026-10-09T08:00:00.000Z"
+        }
+      ]
+    }
+  }
+}

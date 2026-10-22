@@ -1,0 +1,84 @@
+(ns dandori.ingest-test
+  "Linear のエクスポート（合成データ）の取り込み。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [dandori.ingest :as ingest]))
+
+(defn- fixture [f] (fs/readFileSync (str "test/fixtures/" f) "utf8"))
+
+(defn- by-id [issues] (into {} (map (juxt :identifier identity)) issues))
+
+(deftest csv-parser-follows-rfc-4180
+  (is (= [["a" "b" "c"]] (ingest/parse-csv "a,b,c")))
+  (is (= [["a" "b"] ["c" "d"]] (ingest/parse-csv "a,b\r\nc,d\n")))
+  (testing "引用内のカンマ・改行・\"\" のエスケープ"
+    (is (= [["x, y" "line1\nline2" "say \"hi\""]]
+           (ingest/parse-csv "\"x, y\",\"line1\nline2\",\"say \"\"hi\"\"\""))))
+  (testing "空の欄と空の引用欄"
+    (is (= [["" "" "z"]] (ingest/parse-csv ",\"\",z")))
+    (is (= [["\""]] (ingest/parse-csv "\"\"\"\"")))))
+
+(deftest linear-csv-export
+  (let [{:keys [format issues warnings]} (ingest/ingest (fixture "linear-export.csv"))
+        m (by-id issues)]
+    (is (= :linear-csv format))
+    (is (= [] warnings))
+    (is (= ["ENG-12" "ENG-13" "ENG-14" "DES-3"] (map :identifier issues)))
+    (testing "引用の中のカンマ・改行・エスケープ"
+      (is (= "Fix login redirect, again" (get-in m ["ENG-12" :title])))
+      (is (= "Steps:\n1. open /login\n2. the \"next\" param is dropped"
+             (get-in m ["ENG-12" :description])))
+      (is (= "Icon set \"v2\"" (get-in m ["DES-3" :title]))))
+    (testing "列は名前で対応づける"
+      (is (= {:team-key "ENG" :team-name "Engineering" :number 12 :state "In Progress"
+              :state-type :started :priority 2 :estimate 3 :labels ["bug" "auth"]
+              :assignee "Bob Example" :creator "Alice Example" :project "Auth revamp"
+              :cycle {:number 7 :name "Cycle 7"} :due-date "2026-10-20" :parent "ENG-10"
+              :started-at "2026-10-03T09:00:00.000Z"}
+             (select-keys (m "ENG-12") [:team-key :team-name :number :state :state-type
+                                        :priority :estimate :labels :assignee :creator
+                                        :project :cycle :due-date :parent :started-at]))))
+    (testing "空の欄はキーごと持たない"
+      (is (not (contains? (m "ENG-14") :estimate)))
+      (is (not (contains? (m "ENG-14") :cycle)))
+      (is (= [] (:labels (m "ENG-14")))))
+    (testing "独自の状態名は名前から型を推定する"
+      (is (= :started (:state-type (m "ENG-14"))))
+      (is (= :canceled (:state-type (m "DES-3"))))
+      (is (= "2026-10-01T10:00:00.000Z" (:canceled-at (m "DES-3")))))
+    (testing "優先度は Linear のラベル文字列"
+      (is (= [2 3 1 4] (map :priority issues))))))
+
+(deftest linear-graphql-json
+  (let [{:keys [format issues warnings]} (ingest/ingest (fixture "linear-graphql.json"))
+        m (by-id issues)]
+    (is (= :linear-graphql format))
+    (is (= [] warnings))
+    (is (= {:team-key "OPS" :team-name "Operations" :identifier "OPS-41" :number 41
+            :title "Rotate staging certificates" :description "Expires on the 30th."
+            :state "Todo" :state-type :unstarted :priority 1 :estimate 8
+            :labels ["infra" "security"] :assignee "Dana Example" :creator "Erin Example"
+            :cycle {:number 12 :name "Cycle 12"} :due-date "2026-10-30"
+            :created-at "2026-10-10T08:00:00.000Z" :updated-at "2026-10-11T08:00:00.000Z"
+            :sla {:medium-risk-at "2026-10-20T00:00:00.000Z"
+                  :high-risk-at "2026-10-25T00:00:00.000Z"
+                  :breaches-at "2026-10-30T00:00:00.000Z"}
+            :comments [{:body "Owner confirmed." :created-at "2026-10-11T08:00:00.000Z"}]}
+           (m "OPS-41")))
+    (testing "number が無ければ identifier から取る。state.type は名前より優先"
+      (is (= 42 (:number (m "OPS-42"))))
+      (is (= :completed (:state-type (m "OPS-42")))))))
+
+(deftest tolerant-input-shapes
+  (testing "issues.nodes・nodes・配列のどれでも読む"
+    (is (= 1 (count (:issues (ingest/ingest "{\"issues\":{\"nodes\":[{\"identifier\":\"A-1\",\"title\":\"t\"}]}}")))))
+    (is (= 1 (count (:issues (ingest/ingest "{\"nodes\":[{\"identifier\":\"A-1\",\"title\":\"t\"}]}")))))
+    (is (= 1 (count (:issues (ingest/ingest "[{\"identifier\":\"A-1\",\"title\":\"t\"}]"))))))
+  (testing "読めない入力は理由を返す（例外にしない）"
+    (is (seq (:warnings (ingest/ingest "{not json"))))
+    (is (seq (:warnings (ingest/ingest "name,email\nx,y"))))
+    (is (seq (:warnings (ingest/ingest "   ")))))
+  (testing "読めない優先度は No priority にして警告する"
+    (let [{:keys [issues warnings]} (ingest/ingest "ID,Title,Priority\nA-1,t,Someday")]
+      (is (= 0 (:priority (first issues))))
+      (is (= 1 (count warnings))))))
