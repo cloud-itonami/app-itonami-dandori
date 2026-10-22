@@ -1,0 +1,319 @@
+(ns dandori.mcp
+  "dandori を itonami agent の tool にする MCP の中身（Linear JUN-297）。
+
+  `bin/dandori-mcp` が stdio の JSON-RPC をここへ渡し、ここが応答を返す。この
+  ns は I/O をしない —— 1 通のメッセージ（文字列キーの map）を受けて、応答の
+  map（通知なら nil）を返す純関数だけを持つ。判定は画面と同じ adapter
+  （dandori.core / ingest / export）で、新しく書き直さない。wasm guest との
+  一致は test/fixtures/parity.edn の表が担保する（guest はここでは読まない）。
+
+  tool は 5 つ。どれも送信せず、保存せず、本家 Linear の API にも接続しない:
+
+    dandori_import          Linear の CSV / GraphQL JSON → teams と課題（GraphQL 形）
+    dandori_export          課題（dandori_import の出力形）→ CSV / GraphQL JSON
+    dandori_cycle_progress  [{state_type estimate}] → 完了の重み（‰）
+    dandori_check_estimate  見積の値が team の見積設定で使えるか
+    dandori_sla_status      SLA の段階（ok / medium-risk / high-risk / breached）
+
+  入力の不正は JSON-RPC の error ではなく tool の結果（isError true、本文は
+  {\"error\" \"<名前>\" …}）で返す。agent は tool の失敗として読む。"
+  (:require [kotoba.lang.text :as text]
+            [dandori.core :as core]
+            [dandori.export :as export]
+            [dandori.ingest :as ingest]))
+
+(def server-name "dandori")
+(def server-version "0.1.0")
+(def default-protocol-version "2024-11-05")
+
+(def max-text-bytes
+  "取り込み・書き出しに渡す文字列の上限（UTF-8 バイト）。"
+  (* 5 1024 1024))
+
+;; ───────── 入力の検査 ─────────
+
+(defn- tool-error [code & {:as detail}]
+  (ex-info code {::tool-error (merge {"error" code} detail)}))
+
+(defn- utf8-bytes [s]
+  #?(:cljs (.-length (.encode (js/TextEncoder.) s))
+     :clj (count (.getBytes ^String s "UTF-8"))))
+
+(defn- text-arg [args k]
+  (let [v (get args k)]
+    (cond
+      (not (string? v)) (throw (tool-error "invalid-argument" "argument" k "expected" "string"))
+      (> (utf8-bytes v) max-text-bytes)
+      (throw (tool-error "text-too-large" "argument" k "limit_bytes" max-text-bytes))
+      :else v)))
+
+(defn- int-arg [args k default]
+  (let [v (get args k default)]
+    (if (and (number? v) (integer? v))
+      v
+      (throw (tool-error "invalid-argument" "argument" k "expected" "integer")))))
+
+(defn- bool-arg [args k]
+  (let [v (get args k false)]
+    (if (boolean? v)
+      v
+      (throw (tool-error "invalid-argument" "argument" k "expected" "boolean")))))
+
+(defn- enum-arg [args k allowed default]
+  (let [v (get args k default)]
+    (if (some #(= v %) allowed)
+      v
+      (throw (tool-error "invalid-argument" "argument" k "expected" (vec allowed))))))
+
+(defn- reject-unknown [args allowed]
+  (when-let [extra (seq (remove (set allowed) (keys args)))]
+    (throw (tool-error "unknown-argument" "arguments" (vec (sort extra))))))
+
+;; ───────── 出力の形 ─────────
+
+(defn- parse-json [s]
+  #?(:cljs (js->clj (.parse js/JSON s))
+     :clj (throw (ex-info "JSON の構文解析はホストが担う" {}))))
+
+(defn- issue-nodes
+  "db → Linear GraphQL 形の課題ノード（文字列キー）。書き出しと同じ writer を通す
+  ので、dandori_export と取り込み直しがそのまま往復する。"
+  [db]
+  (get-in (parse-json (export/graphql-json db)) ["data" "issues" "nodes"] []))
+
+(defn- team-out [team]
+  (let [{:keys [scale allow-zero? extended?]} (:estimation team)]
+    (cond-> {"key" (:key team)
+             "name" (:name team)
+             "states" (mapv (fn [{:keys [name type]}] {"name" name "type" (some-> type clojure.core/name)})
+                            (:states team))}
+      scale (assoc "estimation" {"scale" (clojure.core/name scale)
+                                 "allow_zero" (boolean allow-zero?)
+                                 "extended" (boolean extended?)}))))
+
+(defn- load-db
+  "正規化済みの課題を空の db に入れる。時刻の無い課題に今の時刻を足さない
+  （tool の出力を入力だけで決まるものにする）。"
+  [issues]
+  (:db (core/merge-import core/empty-db issues nil)))
+
+;; ───────── tools ─────────
+
+(def ^:private formats ["auto" "csv" "graphql-json"])
+
+(defn- parse-export [text fmt]
+  (case fmt
+    "auto" (ingest/ingest text)
+    "csv" (ingest/linear-csv text)
+    "graphql-json" (try (ingest/linear-graphql (parse-json text))
+                        (catch #?(:cljs :default :clj Exception) e
+                          (throw (tool-error "invalid-json" "detail" (ex-message e)))))))
+
+(defn import-tool [args]
+  (reject-unknown args ["text" "format"])
+  (let [parsed (parse-export (text-arg args "text") (enum-arg args "format" formats "auto"))
+        db (load-db (:issues parsed))]
+    {"format" (some-> (:format parsed) name)
+     "teams" (mapv team-out (sort-by :key (vals (:teams db))))
+     "issues" (issue-nodes db)
+     "warnings" (vec (:warnings parsed))}))
+
+(defn export-tool [args]
+  (reject-unknown args ["issues" "format"])
+  (let [issues (get args "issues")
+        fmt (enum-arg args "format" ["csv" "graphql-json"] nil)]
+    (when-not (and (sequential? issues) (every? map? issues))
+      (throw (tool-error "invalid-argument" "argument" "issues"
+                         "expected" "array of issue objects (dandori_import output)")))
+    (let [parsed (ingest/linear-graphql (vec issues))
+          db (load-db (:issues parsed))
+          out (if (= fmt "csv") (export/csv db) (export/graphql-json db))]
+      {"format" fmt "text" out "warnings" (vec (:warnings parsed))})))
+
+(def ^:private state-type-names (mapv name core/state-types))
+
+(defn cycle-progress-tool [args]
+  (reject-unknown args ["issues" "unestimated_weight"])
+  (let [issues (get args "issues")
+        weight (int-arg args "unestimated_weight" 1)
+        _ (when-not (and (sequential? issues) (every? map? issues))
+            (throw (tool-error "invalid-argument" "argument" "issues" "expected" "array of objects")))
+        _ (when (neg? weight)
+            (throw (tool-error "invalid-argument" "argument" "unestimated_weight" "expected" "integer >= 0")))
+        rows (mapv (fn [i]
+                     (reject-unknown i ["state_type" "estimate"])
+                     (let [t (enum-arg i "state_type" state-type-names nil)
+                           e (get i "estimate")]
+                       (when-not (or (nil? e) (and (number? e) (integer? e) (>= e 0)))
+                         (throw (tool-error "invalid-argument" "argument" "estimate" "expected" "integer >= 0 or null")))
+                       [(core/state-type-code (keyword t)) (or e 0)]))
+                   issues)
+        ;; 重みは core/cycle-progress-permille と同じ規則で数える（canceled は
+        ;; scope の外、見積 0 は unestimated_weight）。‰ は guest と同じ関数が出す。
+        weighed (keep (fn [[t e]] (when-not (= t 5) [t (if (zero? e) weight e)])) rows)
+        scope (reduce + 0 (map second weighed))
+        done (reduce + 0 (keep (fn [[t w]] (when (= t 4) w)) weighed))]
+    {"permille" (core/cycle-progress-permille (vec (mapcat identity rows)) weight)
+     "completed_scope" done
+     "scope" scope}))
+
+(def ^:private scale-names (mapv name core/scales))
+
+(defn check-estimate-tool [args]
+  (reject-unknown args ["scale" "value" "allow_zero" "extended"])
+  (let [scale (enum-arg args "scale" scale-names nil)
+        value (int-arg args "value" nil)
+        allow-zero (if (bool-arg args "allow_zero") 1 0)
+        extended (if (bool-arg args "extended") 1 0)
+        code (core/scale-code (keyword scale))
+        ok? #(= 1 (core/estimate-valid? code % allow-zero extended))]
+    {"valid" (ok? value)
+     "allowed" (vec (filter ok? (cons 0 (get core/scale-candidates (keyword scale) []))))}))
+
+(def ^:private sla-names ["ok" "medium-risk" "high-risk" "breached"])
+
+(defn- time-arg
+  "epoch ミリ秒（整数）か ISO-8601 文字列 → epoch ミリ秒。無ければ 0（未設定）。"
+  [args k required?]
+  (let [v (get args k)]
+    (cond
+      (and (nil? v) (not required?)) 0
+      (and (number? v) (integer? v) (>= v 0)) v
+      (string? v) (or (core/parse-time v)
+                      (throw (tool-error "invalid-time" "argument" k)))
+      :else (throw (tool-error "invalid-time" "argument" k)))))
+
+(defn sla-status-tool [args]
+  (reject-unknown args ["now" "medium_at" "high_at" "breach_at"])
+  (let [now (time-arg args "now" true)]
+    {"status" (nth sla-names (core/sla-status now
+                                              (time-arg args "medium_at" false)
+                                              (time-arg args "high_at" false)
+                                              (time-arg args "breach_at" false)))}))
+
+;; ───────── tool の宣言 ─────────
+
+(def ^:private time-schema
+  {"description" "Epoch milliseconds or an ISO-8601 timestamp."
+   "anyOf" [{"type" "integer" "minimum" 0} {"type" "string"}]})
+
+(def tools
+  [{"name" "dandori_import"
+    "description" (str "Parse a Linear CSV export or Linear GraphQL issues JSON into teams and Linear-shaped issue nodes. "
+                       "Pure: nothing is sent, stored or fetched; it does not call the Linear API.")
+    "inputSchema" {"type" "object"
+                   "properties" {"text" {"type" "string" "description" "The export text (CSV or GraphQL JSON), up to 5 MiB."}
+                                 "format" {"type" "string" "enum" formats "default" "auto"}}
+                   "required" ["text"]
+                   "additionalProperties" false}
+    "run" import-tool}
+   {"name" "dandori_export"
+    "description" (str "Write issues (the dandori_import issue nodes) as a Linear-style CSV or Linear GraphQL issues JSON; "
+                       "importing the result again gives the same issues. Pure: returns text only, writes no file.")
+    "inputSchema" {"type" "object"
+                   "properties" {"issues" {"type" "array" "items" {"type" "object"}
+                                           "description" "Issue nodes as returned by dandori_import."}
+                                 "format" {"type" "string" "enum" ["csv" "graphql-json"]}}
+                   "required" ["issues" "format"]
+                   "additionalProperties" false}
+    "run" export-tool}
+   {"name" "dandori_cycle_progress"
+    "description" (str "Completed share of a cycle in permille: canceled issues leave the scope and unestimated issues count as "
+                       "unestimated_weight. This is dandori's documented rule, not Linear's internal calculation.")
+    "inputSchema" {"type" "object"
+                   "properties" {"issues" {"type" "array"
+                                           "items" {"type" "object"
+                                                    "properties" {"state_type" {"type" "string" "enum" state-type-names}
+                                                                  "estimate" {"type" ["integer" "null"] "minimum" 0}}
+                                                    "required" ["state_type"]
+                                                    "additionalProperties" false}}
+                                 "unestimated_weight" {"type" "integer" "minimum" 0 "default" 1}}
+                   "required" ["issues"]
+                   "additionalProperties" false}
+    "run" cycle-progress-tool}
+   {"name" "dandori_check_estimate"
+    "description" (str "Whether an estimate value is allowed by a team's Linear estimate settings "
+                       "(scale, allow zero, extended), and which values are allowed.")
+    "inputSchema" {"type" "object"
+                   "properties" {"scale" {"type" "string" "enum" scale-names}
+                                 "value" {"type" "integer"}
+                                 "allow_zero" {"type" "boolean" "default" false}
+                                 "extended" {"type" "boolean" "default" false}}
+                   "required" ["scale" "value"]
+                   "additionalProperties" false}
+    "run" check-estimate-tool}
+   {"name" "dandori_sla_status"
+    "description" (str "SLA stage of an issue at time now from its medium-risk, high-risk and breach timestamps "
+                       "(Linear slaMediumRiskAt / slaHighRiskAt / slaBreachesAt). Missing timestamps are not set.")
+    "inputSchema" {"type" "object"
+                   "properties" {"now" time-schema
+                                 "medium_at" time-schema
+                                 "high_at" time-schema
+                                 "breach_at" time-schema}
+                   "required" ["now"]
+                   "additionalProperties" false}
+    "run" sla-status-tool}])
+
+(def ^:private tool-by-name (into {} (map (juxt #(get % "name") identity)) tools))
+
+;; ───────── JSON-RPC ─────────
+
+(defn- result [id r] {"jsonrpc" "2.0" "id" id "result" r})
+
+(defn- rpc-error [id code message]
+  {"jsonrpc" "2.0" "id" id "error" {"code" code "message" message}})
+
+(defn- to-json [v]
+  #?(:cljs (.stringify js/JSON (clj->js v))
+     :clj (pr-str v)))
+
+(defn call-tool
+  "tools/call の result。入力の不正は isError の結果にする。"
+  [tool args]
+  (try
+    (let [out ((get tool "run") (or args {}))]
+      {"content" [{"type" "text" "text" (to-json out)}]
+       "structuredContent" out
+       "isError" false})
+    (catch #?(:cljs :default :clj Exception) e
+      (if-let [err (::tool-error (ex-data e))]
+        {"content" [{"type" "text" "text" (to-json err)}] "isError" true}
+        {"content" [{"type" "text" "text" (to-json {"error" "internal-error" "detail" (ex-message e)})}]
+         "isError" true}))))
+
+(defn handle
+  "JSON-RPC の 1 通（文字列キーの map）→ 応答の map。通知（id の無いもの）は nil。"
+  [msg]
+  (let [id (get msg "id")
+        method (get msg "method")
+        params (get msg "params" {})
+        notification? (not (contains? msg "id"))]
+    (cond
+      notification? nil
+      (= method "initialize")
+      (result id {"protocolVersion" (let [v (get params "protocolVersion")]
+                                      (if (and (string? v) (not (text/blank? v))) v default-protocol-version))
+                  "capabilities" {"tools" {}}
+                  "serverInfo" {"name" server-name "version" server-version}})
+      (= method "ping") (result id {})
+      (= method "tools/list")
+      (result id {"tools" (mapv #(dissoc % "run") tools)})
+      (= method "tools/call")
+      (let [tool (tool-by-name (get params "name"))
+            args (get params "arguments" {})]
+        (cond
+          (nil? tool) (rpc-error id -32602 (str "Unknown tool: " (get params "name")))
+          (not (map? args)) (rpc-error id -32602 "arguments must be an object")
+          :else (result id (call-tool tool args))))
+      :else (rpc-error id -32601 (str "Method not found: " method)))))
+
+(defn handle-line
+  "stdin の 1 行 → 書き出す 1 行（JSON 文字列）か nil。空行は無視、読めない行は
+  JSON-RPC の parse error（id null）にする。"
+  [line]
+  (when-not (text/blank? line)
+    (let [msg (try (parse-json line) (catch #?(:cljs :default :clj Exception) _ ::bad))]
+      (cond
+        (= msg ::bad) (to-json (rpc-error nil -32700 "Parse error"))
+        (not (map? msg)) (to-json (rpc-error nil -32600 "Invalid Request"))
+        :else (some-> (handle msg) to-json)))))

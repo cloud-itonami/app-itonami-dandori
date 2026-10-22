@@ -1,0 +1,128 @@
+(ns dandori.mcp-test
+  "dandori.mcp の tool と JSON-RPC の振る舞い（プロセスを起こさない側）。
+  プロセス越しの確認は test/mcp_stdio_test.cljk。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [dandori.mcp :as mcp]))
+
+(defn- call [tool args]
+  (mcp/handle {"jsonrpc" "2.0" "id" 7 "method" "tools/call"
+               "params" {"name" tool "arguments" args}}))
+
+(defn- ok [tool args]
+  (let [r (get (call tool args) "result")]
+    (is (false? (get r "isError")) (pr-str r))
+    (get r "structuredContent")))
+
+(defn- err [tool args]
+  (let [r (get (call tool args) "result")]
+    (is (true? (get r "isError")) (pr-str r))
+    (js->clj (js/JSON.parse (get-in r ["content" 0 "text"])))))
+
+(def csv-text (str (fs/readFileSync "test/fixtures/linear-export.csv" "utf8")))
+(def graphql-text (str (fs/readFileSync "test/fixtures/linear-graphql.json" "utf8")))
+
+(deftest protocol
+  (testing "initialize は client の protocolVersion を返す"
+    (is (= "2025-03-26" (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "initialize"
+                                             "params" {"protocolVersion" "2025-03-26"}})
+                                ["result" "protocolVersion"])))
+    (is (= "2024-11-05" (get-in (mcp/handle {"jsonrpc" "2.0" "id" 1 "method" "initialize"})
+                                ["result" "protocolVersion"]))))
+  (testing "通知には応答しない"
+    (is (nil? (mcp/handle {"jsonrpc" "2.0" "method" "notifications/initialized"}))))
+  (testing "tools/list は 5 つ、どれも object の inputSchema"
+    (let [tools (get-in (mcp/handle {"jsonrpc" "2.0" "id" 2 "method" "tools/list"}) ["result" "tools"])]
+      (is (= ["dandori_import" "dandori_export" "dandori_cycle_progress"
+              "dandori_check_estimate" "dandori_sla_status"]
+             (mapv #(get % "name") tools)))
+      (is (every? #(= "object" (get-in % ["inputSchema" "type"])) tools))
+      (is (every? #(false? (get-in % ["inputSchema" "additionalProperties"])) tools))
+      (is (not-any? #(contains? % "run") tools))))
+  (testing "未知の method と tool は JSON-RPC の error"
+    (is (= -32601 (get-in (mcp/handle {"jsonrpc" "2.0" "id" 3 "method" "resources/list"}) ["error" "code"])))
+    (is (= -32602 (get-in (call "nope" {}) ["error" "code"]))))
+  (testing "読めない行は parse error"
+    (is (= -32700 (get-in (js->clj (js/JSON.parse (mcp/handle-line "{nope"))) ["error" "code"]))))
+  (testing "空行は何も書かない"
+    (is (nil? (mcp/handle-line "  ")))))
+
+(deftest import-csv
+  (let [out (ok "dandori_import" {"text" csv-text})]
+    (is (= "linear-csv" (get out "format")))
+    (is (seq (get out "issues")))
+    (is (every? #(re-matches #"[A-Z][A-Z0-9]*-\d+" (get % "identifier")) (get out "issues")))
+    (is (every? #(get-in % ["state" "type"]) (get out "issues")))
+    (is (seq (get out "teams")))
+    (is (every? #(seq (get % "states")) (get out "teams")))))
+
+(deftest import-graphql-and-forced-format
+  (is (= "linear-graphql" (get (ok "dandori_import" {"text" graphql-text}) "format")))
+  (is (= "linear-graphql" (get (ok "dandori_import" {"text" graphql-text "format" "graphql-json"}) "format")))
+  (is (= "invalid-json" (get (err "dandori_import" {"text" "{nope" "format" "graphql-json"}) "error"))))
+
+(deftest export-round-trips
+  (doseq [[label src] [["csv" csv-text] ["graphql" graphql-text]]
+          fmt ["csv" "graphql-json"]
+          ;; CSV は SLA とコメントを持たない（Linear の CSV と同じ）ので、
+          ;; GraphQL 由来の課題を CSV で往復させる組だけは比べない。
+          :when (not (and (= label "graphql") (= fmt "csv")))]
+    (testing (str label " → " fmt " → import")
+      (let [issues (get (ok "dandori_import" {"text" src}) "issues")
+            text (get (ok "dandori_export" {"issues" issues "format" fmt}) "text")
+            again (get (ok "dandori_import" {"text" text}) "issues")]
+        (is (= issues again)))))
+  (testing "issues の形が違えば isError"
+    (is (= "invalid-argument" (get (err "dandori_export" {"issues" "x" "format" "csv"}) "error")))
+    (is (= "invalid-argument" (get (err "dandori_export" {"issues" [] "format" "xml"}) "error")))))
+
+(deftest cycle-progress
+  (testing "canceled は scope の外、未見積は unestimated_weight"
+    (is (= {"permille" 500 "completed_scope" 3 "scope" 6}
+           (ok "dandori_cycle_progress"
+               {"issues" [{"state_type" "completed" "estimate" 3}
+                          {"state_type" "started" "estimate" 2}
+                          {"state_type" "unstarted"}
+                          {"state_type" "canceled" "estimate" 8}]}))))
+  (testing "unestimated_weight を 0 にすると未見積は数えない"
+    (is (= {"permille" 600 "completed_scope" 3 "scope" 5}
+           (ok "dandori_cycle_progress"
+               {"issues" [{"state_type" "completed" "estimate" 3}
+                          {"state_type" "started" "estimate" 2}
+                          {"state_type" "unstarted" "estimate" nil}]
+                "unestimated_weight" 0}))))
+  (testing "scope が空なら 0"
+    (is (= {"permille" 0 "completed_scope" 0 "scope" 0}
+           (ok "dandori_cycle_progress" {"issues" []}))))
+  (testing "不正な入力"
+    (is (= "invalid-argument" (get (err "dandori_cycle_progress" {"issues" [{"state_type" "doing"}]}) "error")))
+    (is (= "invalid-argument" (get (err "dandori_cycle_progress" {"issues" [{"state_type" "started" "estimate" -1}]}) "error")))
+    (is (= "unknown-argument" (get (err "dandori_cycle_progress" {"issues" [] "extra" 1}) "error")))))
+
+(deftest check-estimate
+  (is (= {"valid" true "allowed" [1 2 3 5 8]}
+         (ok "dandori_check_estimate" {"scale" "fibonacci" "value" 5})))
+  (is (= {"valid" false "allowed" [1 2 3 5 8]}
+         (ok "dandori_check_estimate" {"scale" "fibonacci" "value" 13})))
+  (is (= {"valid" true "allowed" [0 1 2 3 5 8 13 21]}
+         (ok "dandori_check_estimate" {"scale" "tShirt" "value" 21 "allow_zero" true "extended" true})))
+  (is (= {"valid" false "allowed" []}
+         (ok "dandori_check_estimate" {"scale" "notUsed" "value" 1})))
+  (is (= "invalid-argument" (get (err "dandori_check_estimate" {"scale" "weeks" "value" 1}) "error")))
+  (is (= "invalid-argument" (get (err "dandori_check_estimate" {"scale" "linear"}) "error"))))
+
+(deftest sla-status
+  (let [at {"medium_at" "2026-10-20T00:00:00Z" "high_at" "2026-10-21T00:00:00Z" "breach_at" "2026-10-22T00:00:00Z"}]
+    (is (= {"status" "ok"} (ok "dandori_sla_status" (assoc at "now" "2026-10-19T00:00:00Z"))))
+    (is (= {"status" "medium-risk"} (ok "dandori_sla_status" (assoc at "now" "2026-10-20T12:00:00Z"))))
+    (is (= {"status" "high-risk"} (ok "dandori_sla_status" (assoc at "now" "2026-10-21T12:00:00Z"))))
+    (is (= {"status" "breached"} (ok "dandori_sla_status" (assoc at "now" (.parse js/Date "2026-10-23T00:00:00Z"))))))
+  (testing "未設定の時刻は段階を作らない"
+    (is (= {"status" "ok"} (ok "dandori_sla_status" {"now" 1}))))
+  (testing "読めない時刻"
+    (is (= "invalid-time" (get (err "dandori_sla_status" {"now" "yesterday"}) "error")))
+    (is (= "invalid-time" (get (err "dandori_sla_status" {"now" 1 "breach_at" true}) "error")))))
+
+(deftest text-limit
+  (is (= "text-too-large"
+         (get (err "dandori_import" {"text" (apply str (repeat (inc mcp/max-text-bytes) "a"))}) "error"))))
