@@ -3,6 +3,8 @@
 ;;
 ;; - :vendor は site/vendor/ から vendor/<file> へ、この順で <script src> に並ぶ。
 ;;   React UMD は scittle.reagent.js より先に読まれなければならない。
+;; - :external は :sha の commit から取る（生成器が git show で読む）。手元の
+;;   checkout の作業中の状態を公開物に混ぜないため。deps.edn / nbb.edn の pin と揃える。
 ;; - :external と :sources は :to へコピーし、この順で
 ;;   <script type="application/x-scittle"> に並ぶ。scittle は同じ SCI 文脈で
 ;;   順に評価するので、require される側を先に置く。
@@ -12,7 +14,8 @@
  :page {:ns dandori.page :fn document}
  :vendor ["react.production.min.js" "react-dom.production.min.js"
           "scittle.js" "scittle.reagent.js" "scittle.re-frame.js"]
- :external [{:repo "kotoba-lang/text" :from "src/kotoba/lang/text.cljk" :to "kotoba/lang/text.cljs"}]
+ :external [{:repo "kotoba-lang/text" :sha "bc551a3ecc68e551ba1dd2fcb22d5f1b8dd7805d"
+             :from "src/kotoba/lang/text.cljk" :to "kotoba/lang/text.cljs"}]
  :sources [{:from "src/dandori/core.cljk" :to "dandori/core.cljs"}
            {:from "src/dandori/ingest.cljk" :to "dandori/ingest.cljs"}
            {:from "src/dandori/export.cljk" :to "dandori/export.cljs"}
