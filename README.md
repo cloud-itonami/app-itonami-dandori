@@ -43,7 +43,6 @@
 | `bin/dandori-mcp` + `src/dandori/mcp.cljk` | itonami agent 向けの MCP stdio サーバ（tool 5 つ、pure。下記） |
 | `kotoba/dandori/core.kotoba` | 判断コアの `.kotoba` 版（guest と同じ関数・同じ 73 行。amu selfhost で検証。下記） |
 | `kotoba/dandori/work.kotoba` | board から仕事を取る規則（人も bot も同じ。下記） |
-| `scripts/selfhost-gate.sh` | `.kotoba` の gate（amu selfhost の static image。Node・nbb・JVM・babashka を使わない） |
 
 ## 動かし方
 
@@ -116,21 +115,35 @@ agent からは `mcp__dandori__<tool>` という名前で見えます。
     - 幹事: triage、計画、cancel、started の引き戻し、reopen。他人の仕事を完了にはしません。
   - claim は sahai の lease（`kotoba-lang/sahai` の `kotoba/sahai/fence.kotoba`）です。呼び出し側が、claim が生きているかを渡します。lease の epoch が古い holder を fence するので、orphan を取れるのは 1 回だけです。
 
-gate（Node.js・nbb・JVM・babashka を使いません）:
+gate（Node.js・nbb・JVM・babashka を使いません）。2 つの module の ns form を外して 1 つの単位につなぎ、test-* ごとに 1 bit を立てる `main` を足します。それを amu selfhost の root で loaderless な aarch64-linux の static image にして動かします:
 
 ```sh
-AMU=../../kotoba-lang/amu   # kotoba-lang/amu f5b11a08 の checkout
-R=$AMU/seed/bootstrap/aarch64-linux-static-root.elf
-scripts/selfhost-gate.sh $R all kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba
+AMU=../../kotoba-lang/amu; G=$(mktemp -d)   # G は podman が mount できる場所に置く
+cp "$AMU/seed/bootstrap/aarch64-linux-static-root.elf" "$G/root.elf"
+C=kotoba/dandori/core.kotoba; W=kotoba/dandori/work.kotoba
+{ echo '(ns dandori-gate (:export [main]))'
+  tail -n +$(( $(grep -n 'test-next-number\]))' $C | cut -d: -f1) + 1 )) $C
+  tail -n +$(( $(grep -n 'test-move\]))' $W | cut -d: -f1) + 1 )) $W
+  cat <<'EOF'
+(defn main [] :i64
+  (+ (if (test-priority-rank) 1 0) (+ (if (test-estimate-valid) 2 0)
+  (+ (if (test-closed) 4 0) (+ (if (test-active) 8 0)
+  (+ (if (test-transition-kind) 16 0) (+ (if (test-cycle-progress) 32 0)
+  (+ (if (test-sla-status) 64 0) (+ (if (test-next-number) 128 0)
+  (+ (if (test-take) 256 0) (+ (if (test-take-ok) 512 0)
+  (+ (if (test-before) 1024 0) (if (test-move) 2048 0)))))))))))))
+EOF
+} > "$G/gate.kotoba"
+podman run --rm --platform linux/arm64 --network none -e KEXE_CAP_RESOURCES_35="$G" \
+  -v "$G:$G" -w "$G" docker.io/library/python:3.12-alpine sh -c \
+  "./root.elf compile $G/gate.kotoba --target aarch64-linux --output $G/gate.elf --format static \
+   && chmod +x gate.elf && KEXE_STRUCTURED_REPORT=1 ./gate.elf"
 #   → {:status :ok :result 4095 ...}   (12 の test-* がすべて true)
-GATE_SED='/^    claim-live "take\/held"$/d' \
-  scripts/selfhost-gate.sh $R 3839 kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba
-#   → 3839   (live な claim を見ない規則にすると test-take が落ちる)
 ```
 
-- aarch64 Linux では直接動かし、それ以外では podman（linux/arm64、`--network none`）の中で動かします。
+- 負の対照: `work.kotoba` から `claim-live "take/held"` の行を消した写しで同じ gate を組むと `3839` になります（live な claim を見ない規則では test-take が落ちる）。`core.kotoba` の `(= t 5) (cycle-progress-at` を `(= t 6)` にすると `4063` になります（canceled を scope に数えると test-cycle-progress が落ちる）。
 - 2026-10-22 の実測は `docs/evidence/kotoba-selfhost-gate-20261022.edn` にあります。
-- CI（`.github/workflows/selfhost-gate.yml`）は arm64 の runner で同じ gate と 2 つの負の対照を動かします。
+- CI には入れていません。root の AGENTS.md で CDCI は停止中で、再開するのは owner が決めます。新しい shell の tooling も足していません。
 
 ## 未実装（要点）
 

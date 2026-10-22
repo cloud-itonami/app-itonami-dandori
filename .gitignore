@@ -2,4 +2,3 @@ out/
 node_modules/
 .nbb/
 .DS_Store
-.selfhost-gate.*/
