@@ -1,0 +1,43 @@
+(ns dandori.roundtrip-test
+  "書き出し → 取り込みで値が変わらないこと（Linear 互換の 2 形式とも）。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["fs" :as fs]
+            [dandori.core :as core]
+            [dandori.export :as export]
+            [dandori.ingest :as ingest]
+            [kotoba.lang.text :as text]))
+
+(def now "2026-10-22T00:00:00.000Z")
+
+(defn- load [issues] (:db (core/merge-import core/empty-db issues now)))
+
+(defn- reimport [s] (load (:issues (ingest/ingest s))))
+
+(defn- db-from-fixtures []
+  (let [db (load (:issues (ingest/ingest (fs/readFileSync "test/fixtures/linear-export.csv" "utf8"))))]
+    (:db (core/merge-import db (:issues (ingest/ingest (fs/readFileSync "test/fixtures/linear-graphql.json" "utf8"))) now))))
+
+(deftest graphql-json-round-trip-is-lossless
+  (doseq [[label db] [["sample" (load core/sample-issues)] ["fixtures" (db-from-fixtures)]]]
+    (testing label
+      (let [db' (reimport (export/graphql-json db))]
+        (is (= (:issues db) (:issues db')))
+        (is (= (update-vals (:teams db) #(dissoc % :states))
+               (update-vals (:teams db') #(dissoc % :states))))))))
+
+(deftest csv-round-trip-keeps-what-csv-carries
+  (testing "CSV は SLA の時刻とコメントを持たない（Linear の CSV と同じ）。それ以外は一致"
+    (doseq [[label db] [["sample" (load core/sample-issues)] ["fixtures" (db-from-fixtures)]]]
+      (testing label
+        (let [strip #(update-vals % (fn [i] (dissoc i :sla :comments)))
+              db' (reimport (export/csv db))]
+          (is (= (strip (:issues db)) (strip (:issues db')))))))))
+
+(deftest json-writer
+  (is (= "{\n  \"a\": \"x\\\"y\\n\\u0001\"\n}" (export/json {"a" "x\"y\n\u0001"})))
+  (is (= "[]" (export/json [])))
+  (is (= "null" (export/json nil))))
+
+(deftest csv-header-is-linear-shaped
+  (is (= "ID,Team,Title,Description,Status,Estimate,Priority,Project,Creator,Assignee,Labels,Cycle Number,Cycle Name,Created,Updated,Started,Completed,Canceled,Due Date,Parent issue,Status Type"
+         (first (text/split-lines (export/csv core/empty-db))))))

@@ -1,0 +1,55 @@
+(ns dandori.view-test
+  "画面の純関数。SSR では関数が 1 つも混ざらないこと、handler を渡せば付くこと。"
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
+            [dandori.core :as core]
+            [dandori.view :as view]))
+
+(defn- nodes [tree]
+  (let [acc (atom [])]
+    (walk/postwalk (fn [x] (swap! acc conj x) x) tree)
+    @acc))
+
+(defn- texts [tree] (filter string? (nodes tree)))
+
+(defn- has-text? [tree s] (some #(.includes % s) (texts tree)))
+
+(def empty-state {:data core/empty-db :ui view/initial-ui :now-ms 0})
+
+(deftest ssr-has-no-functions
+  (doseq [booting? [true false]]
+    (let [tree (view/root (assoc-in empty-state [:ui :booting?] booting?) view/ssr-handlers)]
+      (testing (str ":booting? " booting?)
+        (is (not-any? fn? (nodes tree)))
+        (testing "JS 無しでも何の道具か・送信しないことが読める"
+          (is (has-text? tree "Linear 互換の課題トラッカー"))
+          (is (has-text? tree "送信されず"))
+          (is (has-text? tree "商標")))))))
+
+(deftest ssr-does-not-claim-empty
+  (testing "SSR（:booting?）は「課題がありません」と言わない"
+    (let [tree (view/root (assoc-in empty-state [:ui :booting?] true) view/ssr-handlers)]
+      (is (not (has-text? tree "まだ課題がありません")))
+      (is (has-text? tree "読み込んでいます")))))
+
+(deftest handlers-attach-in-the-browser
+  (let [seen (atom #{})
+        h (fn [kind ev] (swap! seen conj [kind (first ev)]) (fn [_] nil))
+        db (:db (core/merge-import core/empty-db core/sample-issues "2026-10-22T00:00:00.000Z"))
+        state {:data db :ui (assoc view/initial-ui :team "DAN" :issue "DAN-3")
+               :now-ms (core/parse-time "2026-10-05T12:00:00.000Z")}
+        tree (view/root state h)]
+    (is (some fn? (nodes tree)))
+    (is (contains? @seen [:click :select-issue]))
+    (is (contains? @seen [:value :set-state]))
+    (is (contains? @seen [:value :edit-issue]))
+    (testing "一覧・詳細・サイクルが描かれる"
+      (is (has-text? tree "DAN-3"))
+      (is (has-text? tree "SLA 注意"))
+      (is (has-text? tree "進捗 20.0%")))))
+
+(deftest board-mode
+  (let [db (:db (core/merge-import core/empty-db core/sample-issues "2026-10-22T00:00:00.000Z"))
+        tree (view/root {:data db :ui (assoc view/initial-ui :team "DAN" :mode :board) :now-ms 0}
+                        view/ssr-handlers)]
+    (is (some #(= "dn-board" %) (nodes tree)))))

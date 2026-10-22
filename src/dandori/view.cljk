@@ -1,0 +1,401 @@
+(ns dandori.view
+  "dandori の画面 —— 状態（{:data db :ui ui :now-ms n}）→ hiccup の純関数。
+
+  同じ関数を 2 か所が描く:
+  - **SSR**（site/dandori/page.cljk）: 空の状態で 1 回描き、JS 無しでも
+    「何の道具か・データは送信されない」が読める HTML にする。
+  - **ブラウザ**（site/app.cljk）: Reagent が同じ hiccup を描き直す。
+
+  イベントは引数の `h` から取る: `(h :click ev)` `(h :value ev)`
+  `(h :checked ev)` `(h :file ev)` が handler（または nil）を返す。SSR は常に
+  nil を返す h を渡すので、HTML に関数は混ざらない。ev は re-frame の event
+  ベクタ（:value / :checked / :file は末尾に値を足して dispatch される）。
+
+  hiccup は React 安全に書く: :style を使わない（進捗は <progress>）、
+  :class は文字列、子の列は into で位置に置く（key 警告を出さない）。
+  見た目は DADS（デジタル庁デザインシステム）の class と、page.cljk の
+  app-css だけで作る。"
+  (:require [kotoba.lang.text :as text]
+            [dandori.core :as core]))
+
+;; ───────── 小部品 ─────────
+
+(defn- with-handler [m k f] (if f (assoc m k f) m))
+
+(defn- btn
+  ([h ev label] (btn h ev label {}))
+  ([h ev label {:keys [type size disabled aria-label class]}]
+   [:button (with-handler (cond-> {:type "button" :class (str "dads-button" (when class (str " " class)))
+                                   :data-type (or type "outline") :data-size (or size "sm")}
+                            disabled (assoc :disabled true)
+                            aria-label (assoc :aria-label aria-label))
+              :on-click (h :click ev))
+    label]))
+
+(defn- text-input [h ev value opts]
+  [:span {:class "dads-input-text"}
+   [:input (with-handler (merge {:class "dads-input-text__input" :data-size "sm" :type "text"
+                                 :value (or value "")}
+                                opts)
+             :on-change (h :value ev))]])
+
+(defn- draft-input
+  "入力中は自由に書かせ、フォーカスを外したときに確定する欄（ラベルのカンマ
+  区切りのように、毎打鍵で正規化すると打てなくなる値に使う）。key で課題ごとに
+  作り直す。"
+  [h ev k value opts]
+  [:span {:class "dads-input-text"}
+   [:input (with-handler (merge {:key k :class "dads-input-text__input" :data-size "sm" :type "text"
+                                 :default-value (or value "")}
+                                opts)
+             :on-blur (h :value ev))]])
+
+(defn- text-area [h ev value opts]
+  [:span {:class "dads-textarea"}
+   [:textarea (with-handler (merge {:class "dads-textarea__textarea" :rows 4 :value (or value "")} opts)
+                :on-change (h :value ev))]])
+
+(defn- select-el [h ev value options opts]
+  [:span {:class "dads-select"}
+   [:span {:class "dads-select__control"}
+    (into [:select (with-handler (merge {:class "dads-select__select" :data-size "sm"
+                                         :value (str value)}
+                                        opts)
+                     :on-change (h :value ev))]
+          (map (fn [[v label]] [:option {:value (str v)} label]) options))
+    [:svg {:class "dads-select__chevron" :width 16 :height 16 :viewBox "0 0 24 24" :aria-hidden "true"}
+     [:path {:d "M12 17L3 8L4 7L12 15L20 7L21 8L12 17Z" :fill "currentcolor"}]]]])
+
+(defn- field [id label control & [support]]
+  [:div {:class "dads-form-control-label" :data-size "sm"}
+   [:label {:class "dads-form-control-label__label" :for id} label]
+   (when support [:p {:class "dads-form-control-label__support-text"} support])
+   [:div control]])
+
+(defn- chip [label color]
+  [:span {:class "dads-chip-label" :data-style "text" :data-color color} label])
+
+(def ^:private priority-color {1 "red" 2 "orange" 3 "blue" 4 "gray" 0 "gray"})
+
+(def ^:private sla-badge
+  {1 ["SLA 注意" "yellow"] 2 ["SLA 高リスク" "orange"] 3 ["SLA 超過" "red"]})
+
+(defn- estimate-text [team estimate]
+  (cond
+    (nil? estimate) nil
+    (= :tShirt (get-in team [:estimation :scale])) (core/t-shirt-label estimate (str estimate))
+    :else (str estimate " pt")))
+
+;; ───────── 見出し・足 ─────────
+
+(defn header []
+  [:header {:class "dn-header"}
+   [:h1 {:class "dn-title"} "dandori " [:span {:class "dn-title-sub"} "段取り"]]
+   [:p {:class "dn-lead"}
+    "Linear 互換の課題トラッカー。課題・ワークフロー・見積・サイクルをこのブラウザの中だけで扱います。"
+    "データはどこにも送信されず、この端末の localStorage にだけ保存されます。"]])
+
+(defn footer []
+  [:footer {:class "dn-footer"}
+   [:p "互換はデータ形式（Linear の CSV／GraphQL エクスポート、状態の型・優先度・見積の値）の互換です。"
+    "サイクル進捗の数え方などの規則は dandori のもので、Linear の内部実装の再現ではありません。"]
+   [:p "Linear はその権利者の商標です。dandori は互換を名乗るだけで、Linear との提携も同一性も主張しません。"]
+   [:p "ソース: cloud-itonami/app-itonami-dandori（AGPL-3.0-or-later）"]])
+
+;; ───────── ツールバー ─────────
+
+(defn- team-options [data]
+  (mapv (fn [[k t]] [k (str (:name t) "（" k "）")]) (sort-by key (:teams data))))
+
+(defn toolbar [{:keys [data ui]} h]
+  (let [team (:team ui)]
+    [:div {:class "dn-toolbar" :role "toolbar" :aria-label "操作"}
+     (when (seq (:teams data))
+       [:div {:class "dn-toolbar-group"}
+        [:label {:class "dn-inline-label" :for "dn-team"} "チーム"]
+        (select-el h [:select-team] team (team-options data) {:id "dn-team"})])
+     [:div {:class "dn-toolbar-group"}
+      (btn h [:create-issue] "課題を作成" {:type "solid-fill" :disabled (nil? team)})
+      (btn h [:set-mode (if (= :board (:mode ui)) :list :board)]
+           (if (= :board (:mode ui)) "一覧で見る" "ボードで見る")
+           {:disabled (nil? team)})]
+     [:div {:class "dn-toolbar-group"}
+      (btn h [:toggle-import] (if (:import-open? ui) "取り込みを閉じる" "取り込む"))
+      (btn h [:export :json] "JSON で書き出す" {:disabled (empty? (:issues data))})
+      (btn h [:export :csv] "CSV で書き出す" {:disabled (empty? (:issues data))})]
+     [:div {:class "dn-toolbar-group"}
+      (if (:confirm-clear? ui)
+        [:span {:class "dn-confirm"}
+         (btn h [:clear-all] "本当にすべて消去する" {:type "solid-fill" :class "dn-danger"})
+         (btn h [:cancel-clear] "やめる")]
+        (btn h [:ask-clear] "すべて消去" {:type "text" :disabled (and (empty? (:issues data))
+                                                                    (empty? (:teams data)))}))]]))
+
+;; ───────── 取り込み ─────────
+
+(defn import-panel [{:keys [ui]} h]
+  [:section {:class "dn-panel" :aria-labelledby "dn-import-heading"}
+   [:h2 {:id "dn-import-heading" :class "dn-h2"} "Linear のエクスポートを取り込む"]
+   [:p {:class "dn-help"}
+    "Linear の「Export CSV」の CSV か、GraphQL の issues クエリ結果（JSON）を貼り付けるか、ファイルを選んでください。"
+    "同じ ID（例: ENG-42）の課題は置き換えます。読み込みはこのブラウザの中で行い、何も送信しません。"]
+   (field "dn-import-text" "貼り付け"
+          (text-area h [:set-import-text] (:import-text ui)
+                     {:id "dn-import-text" :rows 8
+                      :placeholder "ID,Team,Title,Description,Status,Estimate,Priority,…\nENG-1,Engineering,…"}))
+   (field "dn-import-file" "ファイル（.csv / .json）"
+          [:input (with-handler {:id "dn-import-file" :type "file" :accept ".csv,.json,text/csv,application/json"}
+                    :on-change (h :file [:import-file]))])
+   [:div {:class "dn-actions"}
+    (btn h [:run-import] "取り込む" {:type "solid-fill"
+                                    :disabled (text/blank? (or (:import-text ui) ""))})]])
+
+(defn import-result [{:keys [added replaced warnings format]} h]
+  [:div {:class "dn-result" :role "status"}
+   [:p (str (case format
+              :linear-csv "CSV"
+              :linear-graphql "GraphQL JSON"
+              "入力")
+            " から " added " 件を追加、" replaced " 件を置き換えました。")]
+   (when (seq warnings)
+     (into [:ul {:class "dn-warnings"}] (map (fn [w] [:li w]) (take 20 warnings))))
+   (btn h [:dismiss-result] "閉じる" {:type "text"})])
+
+;; ───────── 空の状態 ─────────
+
+(defn empty-state [h]
+  [:section {:class "dn-empty"}
+   [:h2 {:class "dn-h2"} "まだ課題がありません"]
+   [:p "Linear からエクスポートした CSV／JSON を取り込むか、チームを作って課題を作成してください。"
+    "試すだけなら、合成データのサンプルを読み込めます。"]
+   [:noscript [:p {:class "dn-noscript"}
+               "この道具は JavaScript で動きます（すべてブラウザの中で処理し、何も送信しません）。"]]
+   [:div {:class "dn-actions"}
+    (btn h [:load-sample] "サンプルを読み込む" {:type "solid-fill"})
+    (btn h [:toggle-import] "取り込む")]])
+
+(defn new-team-form [{:keys [ui]} h]
+  (let [{k :key nm :name} (:new-team ui)
+        ok? (core/valid-team-key? k)]
+    [:div {:class "dn-new-team"}
+     (field "dn-new-team-key" "チームキー"
+            (text-input h [:set-new-team :key] k {:id "dn-new-team-key" :placeholder "ENG" :maxLength 7})
+            "英大文字で始まる英大文字・数字（7 文字まで）。課題 ID の頭になります（ENG-1）。")
+     (field "dn-new-team-name" "チーム名"
+            (text-input h [:set-new-team :name] nm {:id "dn-new-team-name" :placeholder "Engineering"}))
+     (btn h [:create-team] "チームを作る" {:disabled (not ok?)})]))
+
+;; ───────── チームの設定・サイクル ─────────
+
+(defn estimation-settings [team h]
+  (let [{:keys [scale allow-zero? extended?]} (:estimation team)]
+    [:div {:class "dn-settings"}
+     (field "dn-scale" "見積の scale"
+            (select-el h [:set-estimation :scale] (name (or scale :notUsed))
+                       (mapv (fn [s] [(name s) (core/scale-label s)]) core/scales)
+                       {:id "dn-scale"}))
+     [:label {:class "dads-checkbox" :data-size "sm"}
+      [:span {:class "dads-checkbox__checkbox"}
+       [:input (with-handler {:class "dads-checkbox__input" :type "checkbox" :checked (boolean allow-zero?)
+                              :aria-label "見積に 0 を許す"}
+                 :on-change (h :checked [:set-estimation :allow-zero?]))]]
+      [:span {:class "dads-checkbox__label"} "0 を許す"]]
+     [:label {:class "dads-checkbox" :data-size "sm"}
+      [:span {:class "dads-checkbox__checkbox"}
+       [:input (with-handler {:class "dads-checkbox__input" :type "checkbox" :checked (boolean extended?)
+                              :aria-label "拡張した見積値を使う"}
+                 :on-change (h :checked [:set-estimation :extended?]))]]
+      [:span {:class "dads-checkbox__label"} "拡張値を使う"]]]))
+
+(defn cycle-panel [issues h selected]
+  (let [cs (core/cycles issues)]
+    (when (seq cs)
+      (let [n (or selected (:number (first cs)))
+            c (some #(when (= n (:number %)) %) cs)
+            in-cycle (filter #(= n (get-in % [:cycle :number])) issues)
+            {:keys [permille total completed canceled]} (core/cycle-progress in-cycle 1)]
+        [:section {:class "dn-cycle" :aria-labelledby "dn-cycle-heading"}
+         [:div {:class "dn-cycle-head"}
+          [:h2 {:id "dn-cycle-heading" :class "dn-h2"} "サイクル"]
+          (select-el h [:select-cycle] n
+                     (mapv (fn [c] [(:number c) (or (:name c) (str "Cycle " (:number c)))]) cs)
+                     {:id "dn-cycle" :aria-label "サイクル"})]
+         [:progress {:class "dn-progress" :max 1000 :value (max 0 permille)
+                     :aria-label (str (or (:name c) "サイクル") " の進捗")}]
+         [:p {:class "dn-cycle-meta"}
+          (str "進捗 " (quot (max 0 permille) 10) "." (rem (max 0 permille) 10) "%（見積で重み付け。未見積は 1 として数え、Canceled は除く）— "
+               total " 件中 完了 " completed "・取り消し " canceled)]]))))
+
+;; ───────── 一覧・ボード ─────────
+
+(defn- issue-row [team issue h now-ms selected?]
+  (let [sla (core/issue-sla issue now-ms)]
+    [:li {:class (str "dn-issue" (when selected? " dn-issue--selected"))}
+     [:button (with-handler {:type "button" :class "dn-issue-button"
+                             :aria-pressed (if selected? "true" "false")
+                             :aria-label (str (:identifier issue) " " (:title issue) "（"
+                                              (core/priority-label (or (:priority issue) 0)) "）")}
+                :on-click (h :click [:select-issue (:identifier issue)]))
+      [:span {:class "dn-id"} (:identifier issue)]
+      (chip (core/priority-label (or (:priority issue) 0)) (priority-color (or (:priority issue) 0)))
+      [:span {:class "dn-issue-title"} (if (text/blank? (or (:title issue) "")) "（無題）" (:title issue))]
+      [:span {:class "dn-issue-meta"}
+       (into [:span {:class "dn-labels"}] (map #(chip % "gray") (:labels issue)))
+       (when-let [e (estimate-text team (:estimate issue))] [:span {:class "dn-estimate"} e])
+       (when-let [[label color] (sla-badge sla)] (chip label color))
+       (when-let [a (:assignee issue)] [:span {:class "dn-assignee"} a])]]]))
+
+(defn issue-list [team issues h now-ms selected]
+  (into [:div {:class "dn-list"}]
+        (keep (fn [[t is]]
+                (when (seq is)
+                  [:section {:class "dn-group"}
+                   [:h3 {:class "dn-group-heading"} (core/state-type-label t)
+                    [:span {:class "dn-count"} (count is)]]
+                   (into [:ul {:class "dn-issues"}]
+                         (map #(issue-row team % h now-ms (= selected (:identifier %))) is))]))
+              (core/grouped-by-type issues))))
+
+(defn board [team issues h now-ms selected]
+  (into [:div {:class "dn-board"}]
+        (map (fn [[t is]]
+               [:section {:class "dn-column" :aria-label (core/state-type-label t)}
+                [:h3 {:class "dn-group-heading"} (core/state-type-label t) [:span {:class "dn-count"} (count is)]]
+                (into [:ul {:class "dn-issues"}]
+                      (map #(issue-row team % h now-ms (= selected (:identifier %))) is))])
+             (remove (fn [[t is]] (and (= t :canceled) (empty? is)))
+                     (core/grouped-by-type issues)))))
+
+;; ───────── 課題の詳細 ─────────
+
+(defn- estimate-options [team]
+  (let [{:keys [scale allow-zero? extended?]} (:estimation team)
+        code (core/scale-code (or scale :notUsed))
+        vs (concat (when allow-zero? [0]) (get core/scale-candidates scale []))
+        ok (filter #(= 1 (core/estimate-valid? code % (if allow-zero? 1 0) (if extended? 1 0))) vs)]
+    (into [["" "未見積"]]
+          (map (fn [v] [v (if (= scale :tShirt) (core/t-shirt-label v (str v)) (str v))]) ok))))
+
+(defn issue-detail [{:keys [data ui now-ms]} h]
+  (when-let [issue (get-in data [:issues (:issue ui)])]
+    (let [id (:identifier issue)
+          team (get-in data [:teams (:team issue)])
+          problem (core/estimate-problem team (:estimate issue))
+          sla (core/issue-sla issue now-ms)]
+      [:aside {:class "dn-detail" :aria-labelledby "dn-detail-heading"}
+       [:div {:class "dn-detail-head"}
+        [:h2 {:id "dn-detail-heading" :class "dn-h2"} id]
+        (btn h [:select-issue nil] "閉じる" {:type "text"})]
+       (field "dn-f-title" "タイトル"
+              (text-input h [:edit-issue id :title] (:title issue) {:id "dn-f-title"}))
+       (field "dn-f-desc" "説明"
+              (text-area h [:edit-issue id :description] (:description issue) {:id "dn-f-desc" :rows 6}))
+       [:div {:class "dn-detail-grid"}
+        (field "dn-f-state" "状態"
+               (select-el h [:set-state id] (:state issue)
+                          (mapv (fn [{:keys [name type]}] [name (str name "（" (core/state-type-label type) "）")])
+                                (:states team))
+                          {:id "dn-f-state"}))
+        (field "dn-f-priority" "優先度"
+               (select-el h [:edit-issue id :priority] (or (:priority issue) 0) core/priorities
+                          {:id "dn-f-priority"}))
+        (field "dn-f-estimate" "見積"
+               (select-el h [:edit-issue id :estimate] (if (some? (:estimate issue)) (:estimate issue) "")
+                          (estimate-options team) {:id "dn-f-estimate"})
+               (or problem (str "scale: " (core/scale-label (get-in team [:estimation :scale] :notUsed)))))
+        (field "dn-f-cycle" "サイクル番号"
+               (draft-input h [:edit-issue id :cycle] (str id "/cycle")
+                            (some-> (get-in issue [:cycle :number]) str)
+                            {:id "dn-f-cycle" :inputMode "numeric"}))
+        (field "dn-f-due" "期日"
+               (text-input h [:edit-issue id :due-date] (:due-date issue) {:id "dn-f-due" :type "date"}))
+        (field "dn-f-assignee" "担当"
+               (text-input h [:edit-issue id :assignee] (:assignee issue) {:id "dn-f-assignee"}))]
+       (field "dn-f-labels" "ラベル"
+              (draft-input h [:edit-issue id :labels] (str id "/labels")
+                           (text/join ", " (:labels issue)) {:id "dn-f-labels"})
+              "カンマ区切り。欄を離れたときに反映します。")
+       (when (pos? sla)
+         [:p {:class "dn-sla"} (first (sla-badge sla)) "（" (get-in issue [:sla :breaches-at]) " まで）"])
+       (into [:dl {:class "dn-times"}]
+             (mapcat (fn [[k label]] (when-let [v (get issue k)] [[:dt label] [:dd v]]))
+                     [[:created-at "作成"] [:updated-at "更新"] [:started-at "開始"]
+                      [:completed-at "完了"] [:canceled-at "取り消し"]]))
+       [:section {:class "dn-comments"}
+        [:h3 {:class "dn-h3"} "コメント（この端末だけ）"]
+        (into [:ul {:class "dn-comment-list"}]
+              (map (fn [c] [:li [:p (:body c)] [:p {:class "dn-help"} (:created-at c)]]) (:comments issue)))
+        (field "dn-f-comment" "コメントを書く"
+               (text-area h [:set-comment-draft] (:comment-draft ui) {:id "dn-f-comment" :rows 3}))
+        (btn h [:add-comment id] "コメントする" {:disabled (text/blank? (or (:comment-draft ui) ""))})]
+       [:div {:class "dn-actions"}
+        (btn h [:delete-issue id] "この課題を削除" {:type "text" :class "dn-danger"})]])))
+
+;; ───────── 全体 ─────────
+
+(defn workspace [{:keys [data ui now-ms] :as state} h]
+  (let [k (:team ui)
+        team (get-in data [:teams k])
+        issues (core/team-issues data k)]
+    [:div {:class "dn-workspace"}
+     [:div {:class "dn-main"}
+      (when team
+        [:details {:class "dn-team-settings"}
+         [:summary (str (:name team) " の設定")]
+         (estimation-settings team h)])
+      (cycle-panel issues h (:cycle ui))
+      (if (empty? issues)
+        [:p {:class "dn-help"} "このチームにはまだ課題がありません。"]
+        (if (= :board (:mode ui))
+          (board team issues h now-ms (:issue ui))
+          (issue-list team issues h now-ms (:issue ui))))
+      [:details {:class "dn-team-settings"}
+       [:summary "チームを追加する"]
+       (new-team-form state h)]]
+     (issue-detail state h)]))
+
+(declare app-root)
+
+(defn booting
+  "SSR の本文。保存済みのデータはブラウザでしか読めないので、JS が動く前に
+  「課題がありません」と言わない（戻ってきた利用者に空だと誤認させない）。"
+  []
+  [:section {:class "dn-empty" :aria-live "polite"}
+   [:h2 {:class "dn-h2"} "読み込んでいます…"]
+   [:p "この道具は JavaScript で動きます。課題はこのブラウザの localStorage から読み込み、"
+    "どこにも送信しません。"]
+   [:noscript [:p {:class "dn-noscript"}
+               "JavaScript が無効なので動きません。有効にすると、すべてこのブラウザの中で処理します。"]]])
+
+(defn root
+  "画面全体。state = {:data db :ui ui :now-ms n}。:ui の :booting? が真なら
+  （SSR）本文の代わりに booting を描く。"
+  [{:keys [data ui] :as state} h]
+  (if (:booting? ui)
+    [:div {:class "dn-app"} (header) (booting) (footer)]
+    (app-root state h)))
+
+(defn- app-root [{:keys [data ui] :as state} h]
+  [:div {:class "dn-app"}
+   (header)
+   (toolbar state h)
+   (when (:import-open? ui) (import-panel state h))
+   (when-let [r (:import-result ui)] (import-result r h))
+   (if (and (empty? (:issues data)) (empty? (:teams data)))
+     [:div {:class "dn-start"}
+      (empty-state h)
+      [:details {:class "dn-team-settings"}
+       [:summary "チームを作って始める"]
+       (new-team-form state h)]]
+     (workspace state h))
+   (footer)])
+
+(def initial-ui
+  {:booting? false :team nil :issue nil :mode :list :import-open? false :import-text ""
+   :import-result nil :new-team {:key "" :name ""} :comment-draft ""
+   :confirm-clear? false :cycle nil})
+
+(defn ssr-handlers
+  "SSR 用の h: どのイベントにも handler を付けない。"
+  [_kind _ev]
+  nil)

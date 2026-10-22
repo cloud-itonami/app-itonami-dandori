@@ -1,0 +1,92 @@
+(ns dandori.page
+  "app.itonami.cloud/dandori/ のページの殻（SSR）。
+
+  UI は DADS（デジタル庁デザインシステム、`kotoba-lang/jp-go-digital-design-system`）
+  の class と、下の app-css だけで作る —— app.itonami.cloud の他の道具（inkan・
+  shirohan・履歴書）と同じ design system に載せる。
+
+  ## このページは何も送信しない
+
+  課題には担当者名・説明文など、組織の内部情報が入る。**入力は 1 バイトも
+  ネットワークに出ない** —— サーバも fetch も無く、保存はこの端末の
+  localStorage だけ。外部リクエストもゼロにしてある: DADS の CSS は inline、
+  React / scittle は同一オリジンに vendor（site/vendor/PROVENANCE.edn）。
+
+  ## 本文は view と同じ関数
+
+  `<div id=\"app\">` の中身は `dandori.view/root` を空の状態で描いたもの。
+  ブラウザでは site/app.cljk が同じ関数を Reagent で描き直すので、JS が
+  動く前と後で画面の骨格が変わらない（cloud-itonami ADR-0052 と同じ規律）。"
+  (:require [jp-go-dds.page :as dds-page]
+            [dandori.core :as core]
+            [dandori.view :as view]))
+
+(def ^:private site-title "dandori — Linear 互換の課題トラッカー")
+
+(def ^:private site-description
+  "Linear の CSV／GraphQL エクスポートを取り込み、課題・ワークフロー・見積・サイクルをブラウザの中だけで扱います。データは送信されません。")
+
+(def app-css
+  "DADS の上に載せる配置だけ。色は DADS の custom property から引く。"
+  ".dn-app{max-width:80rem;margin:0 auto;padding:1.5rem 1rem 3rem;}
+.dn-title{font-size:1.75rem;font-weight:700;margin:0;}
+.dn-title-sub{font-size:1rem;font-weight:400;margin-left:.5rem;color:var(--color-neutral-solid-gray-600,#666);}
+.dn-lead,.dn-help{color:var(--color-neutral-solid-gray-700,#555);line-height:1.7;}
+.dn-h2{font-size:1.125rem;font-weight:700;margin:0 0 .5rem;}
+.dn-h3{font-size:1rem;font-weight:700;margin:1rem 0 .5rem;}
+.dn-toolbar{display:flex;flex-wrap:wrap;gap:.75rem 1.5rem;align-items:center;margin:1rem 0;padding:.75rem 0;border-block:1px solid var(--color-neutral-solid-gray-200,#ddd);}
+.dn-toolbar-group,.dn-actions,.dn-confirm{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;}
+.dn-inline-label{font-weight:700;}
+.dn-panel,.dn-result,.dn-empty,.dn-cycle,.dn-detail{border:1px solid var(--color-neutral-solid-gray-200,#ddd);border-radius:.5rem;padding:1rem;margin:1rem 0;background:var(--color-neutral-white,#fff);}
+.dn-warnings{color:var(--color-primitive-red-800,#b00);}
+.dn-workspace{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;}
+@media (min-width:64rem){.dn-workspace{grid-template-columns:minmax(0,1fr) 26rem;align-items:start;}.dn-detail{position:sticky;top:1rem;margin-top:0;}}
+.dn-team-settings{margin:1rem 0;}
+.dn-team-settings summary{cursor:pointer;font-weight:700;}
+.dn-settings,.dn-new-team{display:flex;flex-wrap:wrap;gap:1rem;align-items:end;margin-top:.75rem;}
+.dn-cycle-head,.dn-detail-head{display:flex;justify-content:space-between;align-items:center;gap:1rem;}
+.dn-progress{width:100%;height:.75rem;margin:.5rem 0;}
+.dn-cycle-meta{font-size:.875rem;margin:0;}
+.dn-group-heading{display:flex;gap:.5rem;align-items:center;font-size:.9375rem;font-weight:700;margin:1rem 0 .25rem;}
+.dn-count{font-weight:400;color:var(--color-neutral-solid-gray-600,#666);}
+.dn-issues{list-style:none;margin:0;padding:0;}
+.dn-issue-button{display:flex;flex-wrap:wrap;gap:.25rem .75rem;align-items:center;width:100%;text-align:left;padding:.5rem .75rem;border:0;border-bottom:1px solid var(--color-neutral-solid-gray-100,#eee);background:transparent;font:inherit;color:inherit;cursor:pointer;}
+.dn-issue-button:hover{background:var(--color-neutral-solid-gray-50,#f5f5f5);}
+.dn-issue--selected .dn-issue-button{background:var(--color-primitive-blue-50,#eef4ff);}
+.dn-id{font-family:ui-monospace,monospace;font-size:.8125rem;color:var(--color-neutral-solid-gray-600,#666);min-width:4.5rem;}
+.dn-issue-title{flex:1 1 16rem;}
+.dn-issue-meta,.dn-labels{display:flex;flex-wrap:wrap;gap:.25rem;align-items:center;font-size:.8125rem;}
+.dn-board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(16rem,1fr);gap:.75rem;overflow-x:auto;padding-bottom:.5rem;}
+.dn-column{background:var(--color-neutral-solid-gray-50,#f7f7f7);border-radius:.5rem;padding:.25rem .5rem;}
+.dn-column .dn-issue-button{background:var(--color-neutral-white,#fff);border:1px solid var(--color-neutral-solid-gray-100,#eee);border-radius:.375rem;margin:.25rem 0;}
+.dn-detail-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(10rem,1fr));gap:.75rem;}
+.dn-detail .dads-input-text,.dn-detail .dads-textarea,.dn-detail .dads-select,.dn-panel .dads-textarea{width:100%;}
+.dn-times{display:grid;grid-template-columns:auto 1fr;gap:.25rem 1rem;font-size:.8125rem;}
+.dn-times dd{margin:0;}
+.dn-comment-list{list-style:none;padding:0;}
+.dn-sla{font-weight:700;}
+.dn-danger{color:var(--color-primitive-red-800,#b00);}
+.dn-footer{margin-top:3rem;font-size:.8125rem;color:var(--color-neutral-solid-gray-600,#666);line-height:1.7;}
+.dn-noscript{font-weight:700;}")
+
+(def ssr-state
+  "SSR で描く状態。localStorage の中身はブラウザでしか分からないので、
+  「課題がありません」ではなく読み込み中（:booting?）を描く。"
+  {:data core/empty-db :ui (assoc view/initial-ui :booting? true) :now-ms 0})
+
+(defn document
+  "完全な HTML 文書。opts（生成器が渡す。site/site.edn の契約）:
+  :css             vendored dds.css の中身（jp-go-dds.page は I/O を持たない）
+  :vendor-scripts  [\"vendor/react.production.min.js\" …]（この順で <script src>）
+  :scittle-scripts [\"kotoba/lang/text.cljs\" … \"app.cljs\"]（この順で scittle）"
+  [{:keys [css vendor-scripts scittle-scripts]}]
+  (dds-page/->page
+   {:title site-title
+    :description site-description
+    :css css
+    :app-css app-css
+    :head (vec (concat
+                (map (fn [src] [:script {:src (str "./" src)}]) vendor-scripts)
+                (map (fn [src] [:script {:type "application/x-scittle" :src (str "./" src)}])
+                     scittle-scripts)))}
+   [:div {:id "app"} (view/root ssr-state view/ssr-handlers)]))
