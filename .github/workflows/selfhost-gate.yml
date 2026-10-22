@@ -1,0 +1,37 @@
+name: selfhost-gate
+# kotoba/dandori/*.kotoba on the pinned Amu selfhost root, natively on arm64
+# Linux: the root compiles a loaderless aarch64-linux static image and the
+# image runs. No Node.js, nbb, JVM or babashka; sh only orchestrates.
+on:
+  pull_request:
+  push:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      AMU_COMMIT: f5b11a08a88c11ed9f1ab2347400bca1da75d8e9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pinned Amu root (sha256 checked by the gate)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/root.elf" \
+            "https://raw.githubusercontent.com/kotoba-lang/amu/$AMU_COMMIT/seed/bootstrap/aarch64-linux-static-root.elf"
+      - name: Gate (all test-* true)
+        run: scripts/selfhost-gate.sh "$RUNNER_TEMP/root.elf" all kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba
+      - name: "Negative control: a live claim ignored drops test-take"
+        run: |
+          GATE_SED='/^    claim-live "take\/held"$/d' \
+            scripts/selfhost-gate.sh "$RUNNER_TEMP/root.elf" 3839 kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba
+      - name: "Negative control: canceled counted in scope drops test-cycle-progress"
+        run: |
+          GATE_SED='s/^        (= t 5) (cycle-progress-at/        (= t 6) (cycle-progress-at/' \
+            scripts/selfhost-gate.sh "$RUNNER_TEMP/root.elf" 4063 kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba

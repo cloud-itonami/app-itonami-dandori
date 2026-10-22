@@ -1,0 +1,40 @@
+;; dandori .kotoba selfhost gate receipt (Linear JUN-310, JUN-295 step 1;
+;; com-junkawasaki/root ADR-2610222130). The README "Kotoba" commands, run
+;; 2026-10-22 on this Mac's podman machine (applehv, arm64 Linux guest). No
+;; Node.js, nbb, JVM or babashka in the build or the run; the container image
+;; supplies only sh.
+{:schema "dandori.selfhost-gate.v1"
+ :date "2026-10-22"
+ :compiler {:repo "kotoba-lang/amu"
+            :commit "f5b11a08a88c11ed9f1ab2347400bca1da75d8e9"
+            :path "seed/bootstrap/aarch64-linux-static-root.elf"
+            :sha256 "8256bfd8462c2014bf1864f154e88aa7cbb16eda7754aaabf8bf2303dcfc8dc7"}
+ :sources [{:path "kotoba/dandori/core.kotoba"
+            :sha256 "65bfa4177949c21e6d905d9b85a7dc1fc578c295e763e9e320f5bf6a40732329"}
+           {:path "kotoba/dandori/work.kotoba"
+            :sha256 "e44790bc7ac4079aeb4f1ad41ad980f9ce7c8620f41fbbbe20f178ade6bf6a8f"}]
+ :driver {:path "scripts/selfhost-gate.sh"
+          :sha256 "8f0f3075122f3661bd2160e2289efeeb322e4daec5bf8adb89a6563da6c27145"
+          :main "sum of 2^i over the 12 test-* in file order (8 core, 4 work)"}
+ :host {:runtime "podman --platform linux/arm64 --network none"
+        :image "docker.io/library/python:3.12-alpine"
+        :image-digest "sha256:57f679a3910bed1eb16ad722b904a118bca8586ec8ad39d98dd13350e7062cb2"}
+ :runs [{:modules ["core"]
+         :compile "{:ok true, :target :aarch64-linux, :format :static, :code-bytes 114444, :bytes 119296}"
+         :unit-sha256 "c5a985161202238ed35f89b4db329fb49389b896b223a19994a6d8d3b981658d"
+         :result 255 :expected 255}
+        {:modules ["core" "work"]
+         :compile "{:ok true, :target :aarch64-linux, :format :static, :code-bytes 134020, :bytes 139776}"
+         :unit-sha256 "8829b45074bc3f962e6dd98558ace2d8e8104d437954f004593a157f9c7fde52"
+         :result 4095 :expected 4095}]
+ :negative-controls [{:mutation "take-reason ignores a live claim (the claim-live line deleted)"
+                      :unit-sha256 "82b1bd2bbb487aa05acfb0141b25c6dbd91a2493656f4873d30a7ca3e511be0d"
+                      :result 3839 :expected 3839}
+                     {:mutation "cycle progress counts canceled in scope ((= t 5) -> (= t 6))"
+                      :unit-sha256 "76eea6d90c9936481d1978f902b692fe5c1ef8185d1607241412eb49b4a396be"
+                      :result 4063 :expected 4063}
+                     {:mutation "a GATE_SED that changes nothing" :refused true}
+                     {:mutation "core alone with expectation 254" :failed true :result 255}]
+ :parity "core.kotoba's test-* carry the same 73 rows as aiueos/dandori_core.cljk (test/fixtures/parity.edn)"
+ :not-run ["the GitHub Actions run of .github/workflows/selfhost-gate.yml (recorded on the PR)"
+           "the .cljk guest, adapter and kbb tests (unchanged; they still run on Node)"]}

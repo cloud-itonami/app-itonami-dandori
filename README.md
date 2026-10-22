@@ -41,6 +41,9 @@
 | `test/` | kbb テスト、parity fixture、wasm parity（`guest_parity.mjs`）、合成データ |
 | `scripts/build-site.cljk` | 公開物をローカルに組む（プレビュー用。共通クロームは被せない） |
 | `bin/dandori-mcp` + `src/dandori/mcp.cljk` | itonami agent 向けの MCP stdio サーバ（tool 5 つ、pure。下記） |
+| `kotoba/dandori/core.kotoba` | 判断コアの `.kotoba` 版（guest と同じ関数・同じ 73 行。amu selfhost で検証。下記） |
+| `kotoba/dandori/work.kotoba` | board から仕事を取る規則（人も bot も同じ。下記） |
+| `scripts/selfhost-gate.sh` | `.kotoba` の gate（amu selfhost の static image。Node・nbb・JVM・babashka を使わない） |
 
 ## 動かし方
 
@@ -94,6 +97,40 @@ agent からは `mcp__dandori__<tool>` という名前で見えます。
   - そうすると kbb が `nbb.edn` の pin（`kotoba-lang/text` bc551a3）を、west の兄弟 checkout より先に読みます。その分、起動が 1 回増えます（実測で約 1.3 秒）。
 - **書き込むファイル**: 初回の起動に限り、kbb が依存のキャッシュ（`.nbb/.cache`、gitignore 済み）を repo に作ります。このときの「Downloading dependencies...」は stdout に出ますが、agent のクライアントは JSON でない行を読み飛ばします。それ以外のファイルは書きません。
 - **peer run**: itonami agent は peer run で MCP を使いません（itonami-agent README）。
+
+## Kotoba（amu selfhost）
+
+`kotoba/dandori/` は、dandori の判断を amu selfhost だけで compile して動かせる `.kotoba` で書いたものです（Linear JUN-295 の 1 歩目、JUN-310）。
+
+- **`core.kotoba`**: `aiueos/dandori_core.cljk` と同じ 8 関数・同じ符号化です。test は parity 表の 73 行を関数ごとに写したもので、guest と同じ行です。
+  - 違いは形だけです。補助関数を呼び出し元より前に置き、`defn-` を `defn` にしました（seed subset には `defn-` と ns docstring がありません）。test-* は `:bool` を返します。
+  - `.cljk` の guest と wasm は、JUN-295 が adapter と画面を移すまで残します。
+- **`work.kotoba`**: team の一員（人でも bot でも）が board から仕事を取る規則です（root ADR-2610222130）。
+  - 役割は 2 つです。幹事（steward、1）は triage と計画をします。担当（worker、2）は仕事を進めます。
+  - `take-reason`: その課題を今取れるか、と理由を返します。
+    - 取れる: `take/resume`（自分の started で claim が切れたもの）、`take/orphan`（他人の started で claim が切れたもの）、`take/new`（自分か誰のものでもない unstarted）、`take/plan`（幹事の triage／backlog）。
+    - 取れない: `take/closed`、`take/held`（claim が生きている）、`take/blocked`（未完了の blocker がある）、`take/assigned-other`、`take/not-role`、`take/invalid`。
+  - `before?`: 取れる課題 2 つのどちらが先かを返します。resume → orphan → new／plan の順、次に SLA の段階（breached が先）、次に優先度（Urgent が先、No priority が後）、最後に番号の小さい方（古い方）です。
+  - `move-reason`: その役割がその遷移をしてよいかを返します。
+    - 担当: 着手、完了、差し戻し（started → unstarted）。
+    - 幹事: triage、計画、cancel、started の引き戻し、reopen。他人の仕事を完了にはしません。
+  - claim は sahai の lease（`kotoba-lang/sahai` の `kotoba/sahai/fence.kotoba`）です。呼び出し側が、claim が生きているかを渡します。lease の epoch が古い holder を fence するので、orphan を取れるのは 1 回だけです。
+
+gate（Node.js・nbb・JVM・babashka を使いません）:
+
+```sh
+AMU=../../kotoba-lang/amu   # kotoba-lang/amu f5b11a08 の checkout
+R=$AMU/seed/bootstrap/aarch64-linux-static-root.elf
+scripts/selfhost-gate.sh $R all kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba
+#   → {:status :ok :result 4095 ...}   (12 の test-* がすべて true)
+GATE_SED='/^    claim-live "take\/held"$/d' \
+  scripts/selfhost-gate.sh $R 3839 kotoba/dandori/core.kotoba kotoba/dandori/work.kotoba
+#   → 3839   (live な claim を見ない規則にすると test-take が落ちる)
+```
+
+- aarch64 Linux では直接動かし、それ以外では podman（linux/arm64、`--network none`）の中で動かします。
+- 2026-10-22 の実測は `docs/evidence/kotoba-selfhost-gate-20261022.edn` にあります。
+- CI（`.github/workflows/selfhost-gate.yml`）は arm64 の runner で同じ gate と 2 つの負の対照を動かします。
 
 ## 未実装（要点）
 
