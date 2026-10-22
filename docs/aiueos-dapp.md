@@ -23,6 +23,7 @@ dandori を「サーバに課題を置かない分散型 dapp」として実現�
 | 取り込み／書き出し | `src/dandori/ingest.cljk`（Linear CSV・GraphQL JSON）、`src/dandori/export.cljk`（同じ 2 形式） | **実装済み・実測**（往復で値が変わらない） |
 | 画面 | `src/dandori/view.cljk`（純 hiccup）+ `site/app.cljk`（Re-frame / Reagent、scittle）+ `site/dandori/page.cljk`（SSR の殻、DADS） | **実装済み・ブラウザで実測** |
 | 状態 | 課題は localStorage（`itonami.dandori.v1`）だけ。1 ブラウザに閉じる | **実装済み** |
+| agent 統合（MCP） | `bin/dandori-mcp` + `src/dandori/mcp.cljk` — stdio MCP、tool 5 つ（import／export／cycle_progress／check_estimate／sla_status）。pure（送信・保存なし）、判定は adapter | **実装済み・実測**（kbb stdio テスト、itonami-agent の MCP クライアントで discover／call） |
 | 分散状態 | ADR 0005 の cell `mon` / history `ito` / network `nuno` | **未実装**（設計のみ、下記） |
 | 本家 API 直結 | Linear GraphQL API への直接接続（利用者の同意を operation ごとに取る） | **未実装・ブロッカーあり**（下記） |
 
@@ -89,6 +90,25 @@ amu は `kotoba-lang/amu` 74ca4aa6 の `bin/amu`。
   - console エラーなし。
   - 375px 幅で横スクロールなし。
   - 読み込みはローカルで約 0.6 秒（scittle が 6 つの .cljs を順に取得・評価する）。
+
+### agent 統合（MCP、2026-10-22、Linear JUN-297）
+
+- `bin/dandori-mcp` を、itonami agent と同じ 3 行（initialize・initialized・要求）で駆動して確かめた（`test/mcp_stdio_test.cljk`）:
+  - cwd が `/` と repo の両方で tools/list に 5 tool が出る。
+  - tools/call の結果が正しい。
+  - stdout は JSON-RPC の行だけ。
+  - EOF で exit 0。
+  - 不正入力は `isError`。
+- tool 単体のテスト（`test/dandori/mcp_test.cljk`）:
+  - fixture の CSV／GraphQL JSON で import → export → import が一致した（GraphQL 由来を CSV で往復する組は、CSV が SLA とコメントを持たないので比べない）。
+  - サイクル進捗・見積・SLA・5 MiB 上限を確かめた。
+- adapter と合わせて **34 tests, 283 assertions, 0 failures**（`kotoba-lang/text` bc551a3）。
+- **itonami-agent の MCP クライアント**（`kotoba-lang/itonami-agent` main 709c948 の `itonami.agent.mcp`、`git archive` で取り出したもの）で実測した:
+  - `discover` が `mcp__dandori__dandori_import` ほか 5 つを返し、errors は空。
+  - `call dandori_cycle_progress` → `{"permille":750,"completed_scope":3,"scope":4}`。
+  - `call dandori_check_estimate`（fibonacci, 4）→ `{"valid":false,"allowed":[1,2,3,5,8]}`。
+  - 不正な時刻は `{"error":"{\"error\":\"invalid-time\",…}"}` として agent に返る。
+- 未実測: 推論 rail（murakumo）を使った実際の agent turn の中で、モデルが tool を選んで呼ぶところ。
 
 ## 実測した「動かない」／未実装境界（このスライスで解消していない）
 

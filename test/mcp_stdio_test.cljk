@@ -1,0 +1,74 @@
+(ns mcp-stdio-test
+  "bin/dandori-mcp をプロセスとして起こし、itonami agent の MCP クライアント
+  （kotoba-lang/itonami-agent の src/itonami/agent/mcp.cljk）と同じやり方で話す:
+  initialize → notifications/initialized → 要求 の 3 行を stdin に書いて閉じ、
+  stdout の id 2 の行を読む。終了コード 0 でなければ、agent はエラーとして扱う。"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]
+            [kotoba.lang.text :as text]))
+
+(def server (fs/realpathSync "bin/dandori-mcp"))
+
+(defn- line [m] (str (.stringify js/JSON (clj->js m)) "\n"))
+
+(defn- exchange
+  "agent と同じ 3 行を流して {:status :responses :stderr} を返す。"
+  [cwd method params]
+  (let [input (str (line {"jsonrpc" "2.0" "id" 1 "method" "initialize"
+                          "params" {"protocolVersion" "2024-11-05" "capabilities" {}
+                                    "clientInfo" {"name" "itonami-agent" "version" "0.1"}}})
+                   (line {"jsonrpc" "2.0" "method" "notifications/initialized" "params" {}})
+                   (line {"jsonrpc" "2.0" "id" 2 "method" method "params" params}))
+        r (cp/spawnSync "kbb" #js [server]
+                        #js {:cwd cwd :input input :encoding "utf8" :timeout 30000
+                             :env (js/Object.assign #js {} js/process.env)})]
+    {:status (.-status r)
+     :stderr (str (.-stderr r))
+     :responses (->> (text/split-lines (str (.-stdout r)))
+                     (keep #(try (js->clj (.parse js/JSON %)) (catch :default _ nil)))
+                     (filter map?)
+                     vec)
+     :stdout (str (.-stdout r))}))
+
+(defn- by-id [{:keys [responses]} id]
+  (first (filter #(= id (get % "id")) responses)))
+
+(deftest lists-tools-from-any-cwd
+  (doseq [cwd ["/" (path/dirname (path/dirname server))]]
+    (testing (str "cwd " cwd)
+      (let [r (exchange cwd "tools/list" {})]
+        (is (= 0 (:status r)) (:stderr r))
+        (is (= "dandori" (get-in (by-id r 1) ["result" "serverInfo" "name"])))
+        (is (= 5 (count (get-in (by-id r 2) ["result" "tools"]))))
+        (testing "stdout は JSON-RPC の行だけ（通知への応答も無い）"
+          (is (= 2 (count (:responses r))))
+          (is (every? #(= "2.0" (get % "jsonrpc")) (:responses r))))))))
+
+(deftest calls-a-tool-and-exits-zero
+  (let [r (exchange "/" "tools/call" {"name" "dandori_cycle_progress"
+                                      "arguments" {"issues" [{"state_type" "completed" "estimate" 3}
+                                                             {"state_type" "started" "estimate" 3}]}})
+        result (get (by-id r 2) "result")]
+    (is (= 0 (:status r)) (:stderr r))
+    (is (false? (get result "isError")))
+    (is (= {"permille" 500 "completed_scope" 3 "scope" 6} (get result "structuredContent")))
+    (testing "text と structuredContent は同じ値"
+      (is (= (get result "structuredContent")
+             (js->clj (.parse js/JSON (get-in result ["content" 0 "text"]))))))))
+
+(deftest invalid-input-is-a-tool-error
+  (let [r (exchange "/" "tools/call" {"name" "dandori_check_estimate" "arguments" {"scale" "weeks" "value" 1}})
+        result (get (by-id r 2) "result")]
+    (is (= 0 (:status r)))
+    (is (true? (get result "isError")))
+    (is (= "invalid-argument" (get (js->clj (.parse js/JSON (get-in result ["content" 0 "text"]))) "error")))))
+
+(deftest import-over-stdio
+  (let [csv (str (fs/readFileSync "test/fixtures/linear-export.csv" "utf8"))
+        r (exchange "/" "tools/call" {"name" "dandori_import" "arguments" {"text" csv}})
+        out (get-in (by-id r 2) ["result" "structuredContent"])]
+    (is (= 0 (:status r)) (:stderr r))
+    (is (= "linear-csv" (get out "format")))
+    (is (seq (get out "issues")))))

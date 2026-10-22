@@ -40,6 +40,7 @@
 | `site/vendor/` | React 18.3.1 UMD・scittle 0.8.33（同一オリジン配信。出所と digest は `PROVENANCE.edn`） |
 | `test/` | kbb テスト、parity fixture、wasm parity（`guest_parity.mjs`）、合成データ |
 | `scripts/build-site.cljk` | 公開物をローカルに組む（プレビュー用。共通クロームは被せない） |
+| `bin/dandori-mcp` + `src/dandori/mcp.cljk` | itonami agent 向けの MCP stdio サーバ（tool 5 つ、pure。下記） |
 
 ## 動かし方
 
@@ -52,13 +53,47 @@ npm run test:guest       # amu test（:jvm-kir :js :wasm）
 npm run build:guest      # wasm を作り直す（provenance も更新される）
 npm run test:guest-parity  # wasm を kototama-browser-host-v1 で動かし parity.edn と照合
 npm run build:site       # out/site/ に公開物を組む → 静的サーバで開く
+npm run mcp              # MCP stdio サーバを起動する（stdin から JSON-RPC）
 ```
 
 2026-10-22 の実測値は docs/aiueos-dapp.md の「実測」にあります。
 
-- adapter: 22 tests / 183 assertions / 0 failures
+- adapter + MCP: 34 tests / 283 assertions / 0 failures
 - guest: 24/24
 - wasm parity: 73/73
+
+## itonami agent から使う（MCP）
+
+`bin/dandori-mcp` は stdio の MCP サーバです。itonami agent（`kotoba-lang/itonami-agent`）や Hermes の profile から tool として使えます。
+
+profile の `config.yaml` の設定例（パスは west レイアウトでの実際の置き場所にしてください）:
+
+```yaml
+mcp_servers:
+  dandori:
+    command: kbb
+    args: ["/Users/<you>/github/cloud-itonami/app-itonami-dandori/bin/dandori-mcp"]
+```
+
+agent からは `mcp__dandori__<tool>` という名前で見えます。
+
+| tool | 入力 | 出力 |
+|---|---|---|
+| `dandori_import` | `text`（Linear の CSV か GraphQL issues JSON、5 MiB まで）、`format`（`auto`／`csv`／`graphql-json`） | `teams`（状態と見積設定）、`issues`（Linear GraphQL 形のノード）、`warnings` |
+| `dandori_export` | `issues`（`dandori_import` の出力）、`format`（`csv`／`graphql-json`） | `text`（取り込み直すと同じ課題になる） |
+| `dandori_cycle_progress` | `issues`（`[{state_type, estimate}]`）、`unestimated_weight` | `permille`、`completed_scope`、`scope` |
+| `dandori_check_estimate` | `scale`、`value`、`allow_zero`、`extended` | `valid`、`allowed` |
+| `dandori_sla_status` | `now`、`medium_at`、`high_at`、`breach_at`（epoch ms か ISO-8601） | `status`（`ok`／`medium-risk`／`high-risk`／`breached`） |
+
+- **しないこと**: 送信・保存・本家 Linear API への接続。tool は入力テキストを受けて結果を返すだけです。
+- **入力の不正**: JSON-RPC の error ではなく、tool の結果（`isError: true`、本文 `{"error": "<名前>"}`）で返ります。
+- **判定**: 画面と同じ adapter（`src/dandori/*.cljk`）が行います。wasm guest は読み込みません。guest との一致は parity 表（73 行）で担保しています。
+- **起動のしかた**: agent は呼び出しのたびにサーバを 1 つ起動し、3 行（initialize・initialized・要求）を送って stdin を閉じます。サーバは EOF で exit 0 します。
+- **cwd**: どこからでも起動できます。
+  - cwd がこの repo でないときは、repo を cwd にして自分を起動し直します。
+  - そうすると kbb が `nbb.edn` の pin（`kotoba-lang/text` bc551a3）を、west の兄弟 checkout より先に読みます。その分、起動が 1 回増えます（実測で約 1.3 秒）。
+- **書き込むファイル**: 初回の起動に限り、kbb が依存のキャッシュ（`.nbb/.cache`、gitignore 済み）を repo に作ります。このときの「Downloading dependencies...」は stdout に出ますが、agent のクライアントは JSON でない行を読み飛ばします。それ以外のファイルは書きません。
+- **peer run**: itonami agent は peer run で MCP を使いません（itonami-agent README）。
 
 ## 未実装（要点）
 

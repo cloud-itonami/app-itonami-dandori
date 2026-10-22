@@ -10,6 +10,7 @@
     "test:guest": "../../kotoba-lang/amu/bin/amu test aiueos/dandori_core.cljk",
     "build:guest": "../../kotoba-lang/amu/bin/amu compile aiueos/dandori_core.cljk --target wasm32-browser --output aiueos/dandori_core.wasm",
     "test:guest-parity": "node test/guest_parity.mjs ../../kotoba-lang/amu/runtime/browser-host.mjs",
-    "build:site": "kbb --backend sci --classpath src:site:../../kotoba-lang/text/src:../../kotoba-lang/jp-go-digital-design-system/src:../../kotoba-lang/html/src:../../kotoba-lang/css/src scripts/build-site.cljk"
+    "build:site": "kbb --backend sci --classpath src:site:../../kotoba-lang/text/src:../../kotoba-lang/jp-go-digital-design-system/src:../../kotoba-lang/html/src:../../kotoba-lang/css/src scripts/build-site.cljk",
+    "mcp": "kbb bin/dandori-mcp"
   }
 }
